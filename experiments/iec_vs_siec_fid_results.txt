@@ -1,0 +1,9 @@
+IEC vs S-IEC FID Comparison
+Samples per method: all (50K)
+
+Method                       FID
+-----------------------------------
+IEC                         7.20
+IEC+Recon                   7.85
+S-IEC (p80)                 8.79
+No Correction              22.56

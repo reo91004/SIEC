@@ -1,0 +1,17 @@
+method,tau_percentile,num_samples,fid,sfid,trigger_rate,per_sample_nfe,nfe_total,wall_clock_sec,source_log,source_npz,notes
+IEC (author),,50000,7.2048,,0.0,110,5500000,,logs/stage6_fid_official.log,iec_samples.npz,50K seed; IEC author NFE = 100 + n_checks (10)
+IEC+Recon,,50000,7.85445086794482,6.813553441514728,,,,,logs/stage6_fid_recon.log,iec_samples_recon.npz,50K seed; reconstruction IEC variant
+S-IEC p80 (seed 50K),80,50000,8.78727295825496,5.83829983937585,,,,,logs/siec_fid.log,siec_samples.npz,50K seed; trigger_rate/NFE via postmortem
+No correction (never),,2000,22.560975691699866,49.45248107763541,0.0,110,220000,,logs/siec_fid_never.log,siec_never.npz,siec_never.npz=2K samples (NOT 50K); NFE = 100 + n_checks (10) because SIEC sampler 의 unconditional lookahead 포함; plan Risks #2 참조
+Random trigger (placeholder),,,,,,,,,,,placeholder; see 'Random matched to p{P}' and 'Random (p=*)' rows generated when --use-experiment-copy
+Uniform periodic (placeholder),,,,,,,,,,,placeholder; see 'Uniform matched to p{P}' and 'Uniform (period=*)' rows generated when --use-experiment-copy
+S-IEC p80,80,2000,,,,,,,,experiments/yongseong/results/real_04_tradeoff/samples_p80_n2000.npz,sweep
+S-IEC always-on,,2000,,,1.0,120,240000,,,experiments/yongseong/results/real_04_tradeoff/samples_always_n2000.npz,always-on ablation (n_checks=10)
+Random matched to p80 (prob=0.200),,2000,,,0.2,112.0,224000.0,,,experiments/yongseong/results/real_04_tradeoff/samples_random_matched_p80_n2000.npz,"C1 compute-matched to S-IEC p80 (rate=0.2000, n_checks=10); paper primary baseline"
+Uniform matched to p80 (period=5),,2000,,,0.2,112.0,224000.0,,,experiments/yongseong/results/real_04_tradeoff/samples_uniform_matched_p80_period5_n2000.npz,"C1 compute-matched to S-IEC p80 (target rate=0.2000, realized=0.2000, n_checks=10); paper primary baseline"
+Random (p=0.10),,2000,,,0.1,111.0,222000.0,,,experiments/yongseong/results/real_04_tradeoff/samples_random10_n2000.npz,"C1 grid (exploratory, not compute-matched): random trigger (실험 복사본, n_checks=10)"
+Random (p=0.20),,2000,,,0.2,112.0,224000.0,,,experiments/yongseong/results/real_04_tradeoff/samples_random20_n2000.npz,"C1 grid (exploratory, not compute-matched): random trigger (실험 복사본, n_checks=10)"
+Random (p=0.40),,2000,,,0.4,114.0,228000.0,,,experiments/yongseong/results/real_04_tradeoff/samples_random40_n2000.npz,"C1 grid (exploratory, not compute-matched): random trigger (실험 복사본, n_checks=10)"
+Uniform (period=3),,2000,,,0.3333333333333333,113.33333333333333,226666.66666666666,,,experiments/yongseong/results/real_04_tradeoff/samples_uniform3_n2000.npz,"C1 grid (exploratory, not compute-matched): uniform trigger (실험 복사본, n_checks=10)"
+Uniform (period=5),,2000,,,0.2,112.0,224000.0,,,experiments/yongseong/results/real_04_tradeoff/samples_uniform5_n2000.npz,"C1 grid (exploratory, not compute-matched): uniform trigger (실험 복사본, n_checks=10)"
+Uniform (period=10),,2000,,,0.1,111.0,222000.0,,,experiments/yongseong/results/real_04_tradeoff/samples_uniform10_n2000.npz,"C1 grid (exploratory, not compute-matched): uniform trigger (실험 복사본, n_checks=10)"

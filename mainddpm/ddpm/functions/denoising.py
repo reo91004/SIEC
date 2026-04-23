@@ -20,8 +20,8 @@ def generalized_steps(x, seq, model, b, **kwargs):
             at_next = compute_alpha(b, next_t.long())
             xt = xs[-1].to('cuda')
 
-            # import ldm.globalvar as globalvar
-            # globalvar.appendInput((xt, t))
+            import ldm.globalvar as globalvar
+            globalvar.appendInput((xt, t))
 
             et = model(xt, t)
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()

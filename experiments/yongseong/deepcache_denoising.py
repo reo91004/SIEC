@@ -1,3 +1,6 @@
+# [EXP] /home/user/jowithu/Semantic/IEC/mainddpm/ddpm/functions/deepcache_denoising.py 의 실험용 복사본.
+# 원본은 수정하지 않음. 아래 수정 부분은 # [EXP-CN] 태그로 표시.
+# 엔트리인 ddim_cifar_siec.py 의 sys.path shim 이 이 실험 내에서만 원본을 가린다.
 import torch
 
 from scipy.stats import shapiro
@@ -336,6 +339,10 @@ def adaptive_generalized_steps_siec(
     siec_always_correct=False,
     siec_collect_scores=False,
     siec_max_rounds=1,
+    # [EXP-C1] 실험 4 트리거 모드 베이스라인 (random/uniform vs syndrome)
+    trigger_mode="syndrome",
+    trigger_prob=0.2,
+    trigger_period=5,
     **kwargs
 ):
     """
@@ -441,6 +448,12 @@ def adaptive_generalized_steps_siec(
                     # Threshold decision
                     if siec_always_correct:
                         triggered = True
+                    # [EXP-C1] 베이스라인 트리거 모드. syndrome 체크 게이트 안에 두어
+                    # step 별 NFE bookkeeping 이 모드 간에 비교 가능하게 유지.
+                    elif trigger_mode == "random":
+                        triggered = bool(np.random.random() < trigger_prob)
+                    elif trigger_mode == "uniform":
+                        triggered = (cur_i % max(1, trigger_period) == 0)
                     elif tau_schedule is not None:
                         tau_t = float(tau_schedule[cur_i]) if cur_i < len(tau_schedule) else 0.0
                         triggered = (batch_score_value > tau_t)

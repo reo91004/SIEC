@@ -1,0 +1,28 @@
+__pycache__/
+error_dec/cifar/image
+error_dec/cifar/image_recon
+error_dec/cifar/image_siec_full_nb
+error_dec/cifar/image_siec_pilot_nb
+error_dec/cifar/image_siec_sanity_nb
+error_dec/cifar/siec_never
+
+# datasets & large binaries
+calibration/
+data_cifar10/
+atlas/
+classify_image_graph_def.pb
+
+# samples / reference stats
+*.npz
+
+# model weights / caches
+*.pth
+*.pt
+
+# logs
+logs/
+*.log
+
+# backups
+*.bak
+*\ copy.py
