@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""real_04_tradeoff — S-IEC Compute-Quality Tradeoff wrapper (실험 4).
-
-원본 1저자 코드는 건드리지 않는다. 모든 결과/로그/수정 복사본은
-`experiments/yongseong/` 아래에 모인다. 실행은 `conda run -n iec python ...`.
-"""
+"""real_04_tradeoff — Compute/Quality tradeoff wrapper for Experiment 4."""
 from __future__ import annotations
 
 import argparse
@@ -13,30 +9,47 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 IEC_ROOT = Path(__file__).resolve().parent.parent
 EXP_DIR = IEC_ROOT / "experiments/yongseong"
-DEFAULT_RESULTS = EXP_DIR / "results/real_04_tradeoff"
+DEFAULT_RESULTS_BASE = EXP_DIR / "results/real_04_tradeoff"
 PILOT_SCORES = IEC_ROOT / "calibration/pilot_scores_nb.pt"
 REFERENCE_NPZ = IEC_ROOT / "cifar10_reference.npz"
 CIFAR_IMAGE_DIR = IEC_ROOT / "error_dec/cifar"
-LOGS_DIR = IEC_ROOT / "logs"
-
+NUM_STEPS = 100
+SETTING_KEY = "exp4_main"
+RUN_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
 FID_RE = re.compile(r"^FID:\s*([\d.]+)\s*$", re.MULTILINE)
 FID_ALT_RE = re.compile(
     r"^(?:Frechet Inception Distance|frechet_inception_distance):\s*([\d.]+)\s*$",
     re.MULTILINE,
 )
 SFID_RE = re.compile(r"^sFID:\s*([\d.]+)\s*$", re.MULTILINE)
-NUM_STEPS = 100
 
 CSV_KEYS = [
-    "method", "tau_percentile", "num_samples",
-    "fid", "sfid", "trigger_rate", "per_sample_nfe", "nfe_total",
-    "wall_clock_sec", "source_log", "source_npz", "notes",
+    "setting",
+    "method_key",
+    "method",
+    "status",
+    "blocked_reason",
+    "tau_percentile",
+    "num_samples",
+    "fid",
+    "sfid",
+    "trigger_rate",
+    "syndrome_mean",
+    "error_strength",
+    "per_sample_nfe",
+    "nfe_total",
+    "sampling_wall_clock_sec",
+    "fid_wall_clock_sec",
+    "total_wall_clock_sec",
+    "trace_path",
+    "source_npz",
+    "source_log",
+    "notes",
 ]
 
 
@@ -45,55 +58,65 @@ def parse_args():
     p.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--num-samples", type=int, default=2000)
     p.add_argument("--sample-batch", type=int, default=500)
-    p.add_argument("--percentiles", type=int, nargs="+",
-                   default=[30, 50, 60, 70, 80, 90, 95])
+    p.add_argument("--percentiles", type=int, nargs="+", default=[30, 50, 60, 70, 80, 90, 95])
     p.add_argument("--timesteps", type=int, default=100)
-    p.add_argument("--siec-max-rounds", type=int, default=1)
-    p.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS)
+    p.add_argument("--siec-max-rounds", type=int, default=2)
+    p.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_BASE)
     p.add_argument("--skip-tau-calibration", action="store_true")
     p.add_argument("--skip-sampling", action="store_true")
     p.add_argument("--skip-fid", action="store_true")
     p.add_argument("--plot-only", action="store_true")
-    p.add_argument("--use-experiment-copy", action="store_true",
-                   help="Candidate C1-C4 승인 시 실험 복사본 호출 (기본 off)")
-    p.add_argument("--trigger-probs", type=float, nargs="+",
-                   default=[0.1, 0.2, 0.4],
-                   help="[C1] 랜덤 트리거의 Bernoulli 확률들 (실험 복사본 전용)")
-    p.add_argument("--trigger-periods", type=int, nargs="+",
-                   default=[3, 5, 10],
-                   help="[C1] 균등 트리거의 주기 (실험 복사본 전용)")
-    p.add_argument("--trigger-period-default", type=int, default=5,
-                   help="[C1] random 모드에서 sampler가 사용하지 않는 placeholder 주기")
+    p.add_argument(
+        "--cuda-visible-devices",
+        default=os.environ.get("CUDA_VISIBLE_DEVICES", "2"),
+        help="GPU visibility for generated commands and subprocesses (default: 2).",
+    )
     return p.parse_args()
 
 
-def tau_path(p: int) -> Path:
-    return IEC_ROOT / f"calibration/tau_schedule_p{p}.pt"
+def current_run_id() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
 
 
-def image_folder(p: int, n: int) -> Path:
-    return CIFAR_IMAGE_DIR / f"image_siec_p{p}_n{n}"
+def resolve_results_dir(base: Path, plot_only: bool) -> Path:
+    if plot_only:
+        if (base / "results.csv").exists():
+            return base
+        candidates = sorted(p for p in base.iterdir() if p.is_dir() and (p / "results.csv").exists())
+        if not candidates:
+            raise FileNotFoundError(f"no existing run directory found under {base}")
+        return candidates[-1]
+    return base if RUN_DIR_RE.match(base.name) else base / current_run_id()
 
 
-def always_image_folder(n: int) -> Path:
-    return CIFAR_IMAGE_DIR / f"image_siec_always_n{n}"
-
-
-def rel(path: Path) -> str:
+def rel(path: Path | None) -> str | None:
+    if path is None:
+        return None
     try:
         return str(path.relative_to(IEC_ROOT))
     except ValueError:
         return str(path)
 
 
+def sanitize(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
 def conda_python(args) -> list[str]:
-    return ["conda", "run", "--no-capture-output", "-n", "iec", "python"]
+    prefix: list[str] = []
+    if args.cuda_visible_devices:
+        prefix = ["env", f"CUDA_VISIBLE_DEVICES={args.cuda_visible_devices}"]
+    return prefix + ["conda", "run", "--no-capture-output", "-n", "iec", "python"]
 
 
-def entry_script(args, name: str) -> str:
-    if args.use_experiment_copy and (EXP_DIR / name).exists():
+def entry_script(name: str) -> str:
+    if (EXP_DIR / name).exists():
         return f"experiments/yongseong/{name}"
     return f"mainddpm/{name}"
+
+
+def tau_path(percentile: int) -> Path:
+    return IEC_ROOT / f"calibration/tau_schedule_p{percentile}.pt"
 
 
 def png_count(folder: Path) -> int:
@@ -102,425 +125,26 @@ def png_count(folder: Path) -> int:
     return sum(1 for _ in folder.glob("*.png"))
 
 
-_N_CHECKS_CACHE: dict = {}
-
-
-def n_checks_default() -> int:
-    """pilot_scores_nb.pt 에서 **실제 syndrome 측정이 이뤄진** timestep 개수.
-
-    pilot_scores 는 length==NUM_STEPS 로 pre-allocate 되고 interval_seq 위치에서만
-    score 가 기록되며 나머지 bin 은 0 으로 채워진다. 즉 len(bin)>0 기준으로는
-    모든 bin 이 True → 항상 100. 대신 "어떤 값이든 non-zero 인 bin" 을 세면
-    정확히 |interval_seq| (DC10 기준 10) 가 나온다. 파일/환경이 없으면
-    논문용 수치가 정의되지 않으므로 즉시 실패시킨다.
-    """
-    if "v" in _N_CHECKS_CACHE:
-        return _N_CHECKS_CACHE["v"]
-    import numpy as np
-    import torch
-    scores = torch.load(PILOT_SCORES, weights_only=False, map_location="cpu")
-    v = 0
-    for s in scores:
-        arr = np.asarray(s)
-        if arr.size and np.any(arr != 0):
-            v += 1
-    if v == 0:
-        raise RuntimeError(f"no non-zero syndrome bins found in {PILOT_SCORES}")
-    _N_CHECKS_CACHE["v"] = v
-    return v
-
-
-def run_cmd(cmd: list[str], log_path: Path | None = None) -> float:
+def run_cmd(cmd: list[str], log_path: Path) -> float:
     print(f"$ {shlex.join(cmd)}")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "w") as f:
-            proc = subprocess.run(cmd, cwd=IEC_ROOT, stdout=f, stderr=subprocess.STDOUT)
-    else:
-        proc = subprocess.run(cmd, cwd=IEC_ROOT)
+    with open(log_path, "w") as f:
+        proc = subprocess.run(cmd, cwd=IEC_ROOT, stdout=f, stderr=subprocess.STDOUT)
     elapsed = time.time() - t0
     if proc.returncode != 0:
-        raise SystemExit(f"Command failed (rc={proc.returncode}): {shlex.join(cmd)}")
+        raise SystemExit(f"command failed (rc={proc.returncode}): {shlex.join(cmd)}")
     return elapsed
 
 
-def ensure_tau_schedules(args, cmd_sink: list[list[str]]) -> None:
-    for p in args.percentiles:
-        if tau_path(p).exists():
-            continue
-        cmd = conda_python(args) + [
-            entry_script(args, "calibrate_tau_cifar.py"),
-            "--scores_path", "./calibration/pilot_scores_nb.pt",
-            "--percentile", str(p),
-            "--out_path", f"./calibration/tau_schedule_p{p}.pt",
-        ]
-        cmd_sink.append(cmd)
-        if not args.dry_run:
-            run_cmd(cmd)
-
-
-def build_siec_cmd(args, p: int) -> list[str]:
-    return conda_python(args) + [
-        entry_script(args, "ddim_cifar_siec.py"),
-        "--tau_path", f"./calibration/tau_schedule_p{p}.pt",
-        "--tau_percentile", str(p),
-        "--use_siec",
-        "--num_samples", str(args.num_samples),
-        "--sample_batch", str(args.sample_batch),
-        "--weight_bit", "8", "--act_bit", "8",
-        "--replicate_interval", "10",
-        "--image_folder", f"./error_dec/cifar/image_siec_p{p}_n{args.num_samples}",
-        "--siec_max_rounds", str(args.siec_max_rounds),
-    ]
-
-
-def build_always_cmd(args) -> list[str]:
-    return conda_python(args) + [
-        entry_script(args, "ddim_cifar_siec.py"),
-        "--use_siec", "--siec_always_correct",
-        "--num_samples", str(args.num_samples),
-        "--sample_batch", str(args.sample_batch),
-        "--weight_bit", "8", "--act_bit", "8",
-        "--replicate_interval", "10",
-        "--image_folder", f"./error_dec/cifar/image_siec_always_n{args.num_samples}",
-        "--siec_max_rounds", str(args.siec_max_rounds),
-    ]
-
-
-def build_trigger_cmd(args, mode: str, prob: float, period: int) -> list[str]:
-    """랜덤/균등 트리거 베이스라인 (C1). --use-experiment-copy 필요."""
-    tag = f"{mode}{int(round(prob*100)) if mode == 'random' else period}"
-    return conda_python(args) + [
-        entry_script(args, "ddim_cifar_siec.py"),
-        "--use_siec",
-        "--trigger_mode", mode,
-        "--trigger_prob", str(prob),
-        "--trigger_period", str(period),
-        "--tau_path", "./calibration/tau_schedule_never.pt",
-        "--num_samples", str(args.num_samples),
-        "--sample_batch", str(args.sample_batch),
-        "--weight_bit", "8", "--act_bit", "8",
-        "--replicate_interval", "10",
-        "--image_folder", f"./error_dec/cifar/image_siec_{tag}_n{args.num_samples}",
-        "--siec_max_rounds", str(args.siec_max_rounds),
-    ]
-
-
-def build_sweep_rows(args, cmd_sink: list[list[str]]) -> list[dict]:
-    rows = []
-    for p in args.percentiles:
-        folder = image_folder(p, args.num_samples)
-        npz = args.results_dir / f"samples_p{p}_n{args.num_samples}.npz"
-        needs_run = not (npz.exists() or png_count(folder) >= args.num_samples)
-        cmd = build_siec_cmd(args, p)
-        if needs_run:
-            cmd_sink.append(cmd)
-        rows.append({
-            "method": f"S-IEC p{p}",
-            "tau_percentile": p,
-            "num_samples": args.num_samples,
-            "fid": None, "sfid": None, "trigger_rate": None,
-            "per_sample_nfe": None, "nfe_total": None, "wall_clock_sec": None,
-            "source_log": None, "source_npz": rel(npz),
-            "notes": "sweep",
-            "_image_folder": folder, "_npz": npz, "_cmd": cmd, "_needs_run": needs_run,
-        })
-    folder = always_image_folder(args.num_samples)
-    npz = args.results_dir / f"samples_always_n{args.num_samples}.npz"
-    needs_run = not (npz.exists() or png_count(folder) >= args.num_samples)
-    cmd = build_always_cmd(args)
-    if needs_run:
-        cmd_sink.append(cmd)
-    n_checks = n_checks_default()
-    # always-on: 모든 interval 에서 trigger. n_triggered = n_checks.
-    # per_sample_nfe = num_steps + n_checks + (rounds-1) * n_checks
-    always_nfe = NUM_STEPS + n_checks + max(0, args.siec_max_rounds - 1) * n_checks
-    rows.append({
-        "method": "S-IEC always-on",
-        "tau_percentile": None,
-        "num_samples": args.num_samples,
-        "fid": None, "sfid": None, "trigger_rate": 1.0,
-        "per_sample_nfe": always_nfe,
-        "nfe_total": args.num_samples * always_nfe,
-        "wall_clock_sec": None,
-        "source_log": None, "source_npz": rel(npz),
-        "notes": f"always-on ablation (n_checks={n_checks})",
-        "_image_folder": folder, "_npz": npz, "_cmd": cmd, "_needs_run": needs_run,
-    })
-
-    # [C1] 랜덤/균등 트리거 베이스라인 — 실험 복사본이 있을 때만 emit.
-    # NFE 공식은 S-IEC sampler (adaptive_generalized_steps_siec) 기준:
-    #   per_sample_nfe = num_steps + n_checks + (rounds - 1) * n_triggered
-    # n_triggered 는 random 은 prob*n_checks, uniform 은 (1/period)*n_checks 기댓값.
-    if args.use_experiment_copy and (EXP_DIR / "ddim_cifar_siec.py").exists():
-        n_checks = n_checks_default()
-        rounds_factor = max(0, args.siec_max_rounds - 1)
-
-        # [C1-matched] 논문 주력 비교: 각 S-IEC percentile p 에 대해 측정된
-        # trigger rate 와 동일한 rate 를 갖는 Random(prob=rate) / Uniform(period=round(1/rate))
-        # 를 emit. build_sweep_rows 는 commands.sh 생성만 담당하므로, 이 블록은
-        # tau_path(p) 가 이미 존재할 때만 postmortem 을 돌려 매칭 rate 를 구한다.
-        for p in args.percentiles:
-            if not tau_path(p).exists():
-                continue
-            p80_rate, _nfe, _n = postmortem(p, args.timesteps, args.siec_max_rounds)
-            if p80_rate <= 0.0:
-                raise RuntimeError(
-                    f"cannot build compute-matched baselines for p{p}: "
-                    f"postmortem trigger rate is {p80_rate}"
-                )
-            # Matched Random (prob = mean_rate)
-            tag = f"random_matched_p{p}"
-            folder = CIFAR_IMAGE_DIR / f"image_siec_{tag}_n{args.num_samples}"
-            npz = args.results_dir / f"samples_{tag}_n{args.num_samples}.npz"
-            needs_run = not (npz.exists() or png_count(folder) >= args.num_samples)
-            cmd = build_trigger_cmd(args, "random", p80_rate, args.trigger_period_default)
-            # override image_folder tag so the subprocess knows where to write
-            for i, tok in enumerate(cmd):
-                if tok.endswith(f"image_siec_random{int(round(p80_rate*100))}_n{args.num_samples}"):
-                    cmd[i] = f"./error_dec/cifar/image_siec_{tag}_n{args.num_samples}"
-                    break
-            if needs_run:
-                cmd_sink.append(cmd)
-            random_nfe = NUM_STEPS + n_checks + rounds_factor * p80_rate * n_checks
-            rows.append({
-                "method": f"Random matched to p{p} (prob={p80_rate:.3f})",
-                "tau_percentile": None,
-                "num_samples": args.num_samples,
-                "fid": None, "sfid": None,
-                "trigger_rate": float(p80_rate),
-                "per_sample_nfe": random_nfe,
-                "nfe_total": args.num_samples * random_nfe,
-                "wall_clock_sec": None,
-                "source_log": None, "source_npz": rel(npz),
-                "notes": (f"C1 compute-matched to S-IEC p{p} (rate={p80_rate:.4f}, "
-                          f"n_checks={n_checks}); paper primary baseline"),
-                "_image_folder": folder, "_npz": npz, "_cmd": cmd, "_needs_run": needs_run,
-            })
-            # Matched Uniform (period = round(1/rate))
-            period_match = max(1, int(round(1.0 / p80_rate)))
-            tag = f"uniform_matched_p{p}_period{period_match}"
-            folder = CIFAR_IMAGE_DIR / f"image_siec_{tag}_n{args.num_samples}"
-            npz = args.results_dir / f"samples_{tag}_n{args.num_samples}.npz"
-            needs_run = not (npz.exists() or png_count(folder) >= args.num_samples)
-            cmd = build_trigger_cmd(args, "uniform", 0.0, period_match)
-            for i, tok in enumerate(cmd):
-                if tok.endswith(f"image_siec_uniform{period_match}_n{args.num_samples}"):
-                    cmd[i] = f"./error_dec/cifar/image_siec_{tag}_n{args.num_samples}"
-                    break
-            if needs_run:
-                cmd_sink.append(cmd)
-            expected_rate = 1.0 / period_match
-            uniform_nfe = NUM_STEPS + n_checks + rounds_factor * expected_rate * n_checks
-            rows.append({
-                "method": f"Uniform matched to p{p} (period={period_match})",
-                "tau_percentile": None,
-                "num_samples": args.num_samples,
-                "fid": None, "sfid": None,
-                "trigger_rate": expected_rate,
-                "per_sample_nfe": uniform_nfe,
-                "nfe_total": args.num_samples * uniform_nfe,
-                "wall_clock_sec": None,
-                "source_log": None, "source_npz": rel(npz),
-                "notes": (f"C1 compute-matched to S-IEC p{p} "
-                          f"(target rate={p80_rate:.4f}, realized={expected_rate:.4f}, "
-                          f"n_checks={n_checks}); paper primary baseline"),
-                "_image_folder": folder, "_npz": npz, "_cmd": cmd, "_needs_run": needs_run,
-            })
-
-        for prob in args.trigger_probs:
-            tag = f"random{int(round(prob*100))}"
-            folder = CIFAR_IMAGE_DIR / f"image_siec_{tag}_n{args.num_samples}"
-            npz = args.results_dir / f"samples_{tag}_n{args.num_samples}.npz"
-            needs_run = not (npz.exists() or png_count(folder) >= args.num_samples)
-            cmd = build_trigger_cmd(args, "random", prob, args.trigger_period_default)
-            if needs_run:
-                cmd_sink.append(cmd)
-            per_sample_nfe = NUM_STEPS + n_checks + rounds_factor * prob * n_checks
-            rows.append({
-                "method": f"Random (p={prob:.2f})",
-                "tau_percentile": None,
-                "num_samples": args.num_samples,
-                "fid": None, "sfid": None,
-                "trigger_rate": float(prob),
-                "per_sample_nfe": per_sample_nfe,
-                "nfe_total": args.num_samples * per_sample_nfe,
-                "wall_clock_sec": None,
-                "source_log": None, "source_npz": rel(npz),
-                "notes": (f"C1 grid (exploratory, not compute-matched): "
-                          f"random trigger (실험 복사본, n_checks={n_checks})"),
-                "_image_folder": folder, "_npz": npz, "_cmd": cmd, "_needs_run": needs_run,
-            })
-        for period in args.trigger_periods:
-            tag = f"uniform{period}"
-            folder = CIFAR_IMAGE_DIR / f"image_siec_{tag}_n{args.num_samples}"
-            npz = args.results_dir / f"samples_{tag}_n{args.num_samples}.npz"
-            needs_run = not (npz.exists() or png_count(folder) >= args.num_samples)
-            cmd = build_trigger_cmd(args, "uniform", 0.0, period)
-            if needs_run:
-                cmd_sink.append(cmd)
-            expected_rate = 1.0 / max(1, period)
-            per_sample_nfe = NUM_STEPS + n_checks + rounds_factor * expected_rate * n_checks
-            rows.append({
-                "method": f"Uniform (period={period})",
-                "tau_percentile": None,
-                "num_samples": args.num_samples,
-                "fid": None, "sfid": None,
-                "trigger_rate": expected_rate,
-                "per_sample_nfe": per_sample_nfe,
-                "nfe_total": args.num_samples * per_sample_nfe,
-                "wall_clock_sec": None,
-                "source_log": None, "source_npz": rel(npz),
-                "notes": (f"C1 grid (exploratory, not compute-matched): "
-                          f"uniform trigger (실험 복사본, n_checks={n_checks})"),
-                "_image_folder": folder, "_npz": npz, "_cmd": cmd, "_needs_run": needs_run,
-            })
-    return rows
-
-
 def parse_fid_log(log_path: Path) -> tuple[float | None, float | None]:
-    if not log_path.exists():
-        raise FileNotFoundError(f"required FID log not found: {log_path}")
     text = log_path.read_text(errors="ignore")
     m_fid = FID_RE.search(text) or FID_ALT_RE.search(text)
     m_sfid = SFID_RE.search(text)
-    if not m_fid:
-        raise ValueError(f"FID metric not found in {log_path}")
     return (
-        float(m_fid.group(1)),
+        float(m_fid.group(1)) if m_fid else None,
         float(m_sfid.group(1)) if m_sfid else None,
     )
-
-
-def seed_rows() -> list[dict]:
-    fid_siec, sfid_siec = parse_fid_log(LOGS_DIR / "siec_fid.log")
-    fid_never, sfid_never = parse_fid_log(LOGS_DIR / "siec_fid_never.log")
-    fid_official, sfid_official = parse_fid_log(LOGS_DIR / "stage6_fid_result.txt")
-    fid_recon, sfid_recon = parse_fid_log(LOGS_DIR / "stage6_fid_recon.log")
-    n_checks = n_checks_default()
-    # IEC author (`adaptive_generalized_steps_3`) 는 interval_seq 위치에서 max_iter=2
-    # 로 2 forwards 를 항상 수행 (residual<tol break 은 max_iter=2 에서 no-op).
-    # → NFE = 100 + n_checks. 기존 코드의 100 은 잘못된 하한이었음.
-    iec_nfe = NUM_STEPS + n_checks
-    # "No correction (never)" 는 siec sampler 를 tau=never 로 돌려 생성 → 여전히
-    # interval_seq 위치에서 unconditional lookahead (step_nfe += 1) 가 발생 → 110.
-    never_nfe = NUM_STEPS + n_checks
-    return [
-        {
-            "method": "IEC (author)", "tau_percentile": None, "num_samples": 50000,
-            "fid": fid_official,
-            "sfid": sfid_official,
-            "trigger_rate": 0.0,
-            "per_sample_nfe": iec_nfe, "nfe_total": 50000 * iec_nfe,
-            "wall_clock_sec": None,
-            "source_log": "logs/stage6_fid_result.txt",
-            "source_npz": "iec_samples.npz",
-            "notes": f"50K seed; IEC author NFE = 100 + n_checks ({n_checks})",
-        },
-        {
-            "method": "IEC+Recon", "tau_percentile": None, "num_samples": 50000,
-            "fid": fid_recon,
-            "sfid": sfid_recon,
-            "trigger_rate": None, "per_sample_nfe": None, "nfe_total": None,
-            "wall_clock_sec": None,
-            "source_log": "logs/stage6_fid_recon.log",
-            "source_npz": "iec_samples_recon.npz",
-            "notes": "50K seed; reconstruction IEC variant",
-        },
-        {
-            "method": "S-IEC p80 (seed 50K)", "tau_percentile": 80, "num_samples": 50000,
-            "fid": fid_siec,
-            "sfid": sfid_siec,
-            "trigger_rate": None, "per_sample_nfe": None, "nfe_total": None,
-            "wall_clock_sec": None,
-            "source_log": "logs/siec_fid.log",
-            "source_npz": "siec_samples.npz",
-            "notes": "50K seed; trigger_rate/NFE via postmortem",
-        },
-        {
-            "method": "No correction (never)", "tau_percentile": None, "num_samples": 2000,
-            "fid": fid_never, "sfid": sfid_never,
-            "trigger_rate": 0.0,
-            "per_sample_nfe": never_nfe, "nfe_total": 2000 * never_nfe,
-            "wall_clock_sec": None,
-            "source_log": "logs/siec_fid_never.log",
-            "source_npz": "siec_never.npz",
-            "notes": (f"siec_never.npz=2K samples (NOT 50K); NFE = 100 + n_checks "
-                      f"({n_checks}) because SIEC sampler 의 unconditional lookahead 포함; "
-                      "plan Risks #2 참조"),
-        },
-        {
-            "method": "Random trigger (placeholder)", "tau_percentile": None, "num_samples": None,
-            "fid": None, "sfid": None,
-            "trigger_rate": None, "per_sample_nfe": None, "nfe_total": None,
-            "wall_clock_sec": None, "source_log": None, "source_npz": None,
-            "notes": ("placeholder; see 'Random matched to p{P}' and 'Random (p=*)' rows "
-                      "generated when --use-experiment-copy"),
-        },
-        {
-            "method": "Uniform periodic (placeholder)", "tau_percentile": None, "num_samples": None,
-            "fid": None, "sfid": None,
-            "trigger_rate": None, "per_sample_nfe": None, "nfe_total": None,
-            "wall_clock_sec": None, "source_log": None, "source_npz": None,
-            "notes": ("placeholder; see 'Uniform matched to p{P}' and 'Uniform (period=*)' rows "
-                      "generated when --use-experiment-copy"),
-        },
-    ]
-
-
-def postmortem(percentile: int, num_steps: int, rounds: int):
-    """pilot scores + tau 로 per-sample NFE / trigger rate 를 추정.
-
-    실제 S-IEC NFE 구조 (adaptive_generalized_steps_siec):
-      - base step 당 main forward: num_steps
-      - interval_seq 위치마다 **trigger 여부와 무관한** lookahead forward 1회
-      - siec_max_rounds >= 2 일 때 trigger 된 interval 에서 추가 lookahead (rounds-1)
-
-    → per_sample_nfe = num_steps + N_check + (rounds - 1) * N_trigger
-      where N_check = |interval_seq|, N_trigger = sum(trigger_rate) over interval.
-
-    pilot_scores 는 interval_seq 위치에서만 데이터가 쌓이므로, 빈 배열이
-    아닌 t 의 개수를 N_check 로 empirically 추정한다.
-    """
-    import numpy as np
-    import torch
-
-    scores = torch.load(PILOT_SCORES, weights_only=False, map_location="cpu")
-    tau = torch.load(tau_path(percentile), weights_only=False, map_location="cpu")
-    tau_np = np.asarray(tau).reshape(-1)
-    rates = []
-    n_checks = 0
-    for t in range(num_steps):
-        s = np.asarray(scores[t]) if t < len(scores) else np.array([])
-        # pilot_scores 는 전 길이가 allocate 되지만 interval_seq 가 아닌 위치는
-        # 0 으로 패딩. 실제 syndrome 측정이 있었던 bin 만 interval position 으로 카운트.
-        if s.size == 0 or not np.any(s != 0):
-            rates.append(0.0)
-            continue
-        n_checks += 1
-        tau_t = float(tau_np[t]) if t < len(tau_np) else float("inf")
-        rates.append(float((s > tau_t).mean()))
-    sum_rate = float(np.sum(rates))
-    mean_rate = (sum_rate / n_checks) if n_checks > 0 else 0.0
-    per_sample_nfe = num_steps + n_checks + max(0, rounds - 1) * sum_rate
-    return mean_rate, per_sample_nfe, n_checks
-
-
-def fill_postmortem(rows: list[dict], args) -> None:
-    for row in rows:
-        p = row.get("tau_percentile")
-        if p is None or row.get("trigger_rate") is not None and row.get("per_sample_nfe") is not None:
-            continue
-        if not tau_path(p).exists():
-            row["notes"] = (row.get("notes") or "") + f"; tau_schedule_p{p}.pt missing"
-            continue
-        tr, nfe, n_checks = postmortem(p, args.timesteps, args.siec_max_rounds)
-        row["trigger_rate"] = tr
-        row["per_sample_nfe"] = nfe
-        row["notes"] = ((row.get("notes") or "") + f"; n_checks={n_checks}").lstrip("; ")
-        if row.get("num_samples"):
-            row["nfe_total"] = row["num_samples"] * nfe
 
 
 def pngs_to_npz(png_dir: Path, out_npz: Path) -> int:
@@ -534,49 +158,432 @@ def pngs_to_npz(png_dir: Path, out_npz: Path) -> int:
     return arr.shape[0]
 
 
-def run_fid(sample_npz: Path, log_path: Path) -> tuple[float | None, float | None]:
-    cmd = ["conda", "run", "--no-capture-output", "-n", "iec",
-           "python", "evaluator_FID.py", str(REFERENCE_NPZ), str(sample_npz)]
+def run_fid(args, sample_npz: Path, log_path: Path) -> tuple[float | None, float | None, float]:
+    cmd = conda_python(args) + ["evaluator_FID.py", str(REFERENCE_NPZ), str(sample_npz)]
     print(f"$ {shlex.join(cmd)}")
+    t0 = time.time()
     proc = subprocess.run(cmd, cwd=IEC_ROOT, capture_output=True, text=True)
+    elapsed = time.time() - t0
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(proc.stdout + proc.stderr)
-    m_fid = FID_RE.search(proc.stdout)
-    m_sfid = SFID_RE.search(proc.stdout)
-    return (
-        float(m_fid.group(1)) if m_fid else None,
-        float(m_sfid.group(1)) if m_sfid else None,
-    )
+    fid, sfid = parse_fid_log(log_path)
+    return fid, sfid, elapsed
 
 
-def execute_sweep(rows: list[dict], args) -> None:
-    if not args.skip_sampling:
-        for row in rows:
-            if not row.get("_needs_run"):
+def ensure_tau_schedules(args, cmd_sink: list[list[str]]) -> None:
+    for percentile in args.percentiles:
+        if tau_path(percentile).exists():
+            continue
+        cmd = conda_python(args) + [
+            entry_script("calibrate_tau_cifar.py"),
+            "--scores_path", "./calibration/pilot_scores_nb.pt",
+            "--percentile", str(percentile),
+            "--out_path", f"./calibration/tau_schedule_p{percentile}.pt",
+        ]
+        cmd_sink.append(cmd)
+        if not args.dry_run:
+            run_cmd(cmd, args.results_dir / "logs" / f"calibrate_p{percentile}.log")
+
+
+def pilot_trigger_rate(percentile: int) -> float | None:
+    if not tau_path(percentile).exists() or not PILOT_SCORES.exists():
+        return None
+    try:
+        import numpy as np
+        import torch
+    except ModuleNotFoundError:
+        return None
+
+    raw_scores = torch.load(PILOT_SCORES, weights_only=False, map_location="cpu")
+    if isinstance(raw_scores, dict):
+        scores_by_t = raw_scores.get("scores_by_t", [])
+        batch_means_by_t = raw_scores.get("batch_score_means_by_t", [])
+    else:
+        scores_by_t = raw_scores
+        batch_means_by_t = None
+    tau = np.asarray(torch.load(tau_path(percentile), weights_only=False, map_location="cpu")).reshape(-1)
+    rates = []
+    for step in range(NUM_STEPS):
+        arr = np.asarray(scores_by_t[step]) if step < len(scores_by_t) else np.array([])
+        if arr.size == 0 or not np.any(arr != 0):
+            continue
+        tau_t = float(tau[step]) if step < len(tau) else float("inf")
+        if batch_means_by_t is not None and step < len(batch_means_by_t):
+            batch_arr = np.asarray(batch_means_by_t[step], dtype=float)
+            if batch_arr.size == 0:
                 continue
-            log = args.results_dir / "logs" / f"sampling_{row['method'].replace(' ', '_')}.log"
-            row["wall_clock_sec"] = run_cmd(row["_cmd"], log)
-    if args.skip_fid:
+            rates.append(float((batch_arr > tau_t).mean()))
+        else:
+            rates.append(float((arr > tau_t).mean()))
+    if not rates:
+        return None
+    return float(sum(rates) / len(rates))
+
+
+def make_base_row(method_key: str, method: str, num_samples: int, notes: str = "") -> dict:
+    return {
+        "setting": SETTING_KEY,
+        "method_key": method_key,
+        "method": method,
+        "status": "ready",
+        "blocked_reason": None,
+        "tau_percentile": None,
+        "num_samples": num_samples,
+        "fid": None,
+        "sfid": None,
+        "trigger_rate": None,
+        "syndrome_mean": None,
+        "error_strength": None,
+        "per_sample_nfe": None,
+        "nfe_total": None,
+        "sampling_wall_clock_sec": None,
+        "fid_wall_clock_sec": None,
+        "total_wall_clock_sec": None,
+        "trace_path": None,
+        "source_npz": None,
+        "source_log": None,
+        "notes": notes,
+    }
+
+
+def build_sampling_cmd(
+    args,
+    correction_mode: str,
+    image_folder: Path,
+    trace_path_: Path,
+    tau_percentile: int | None = None,
+    always_correct: bool = False,
+    trigger_mode: str | None = None,
+    trigger_prob: float | None = None,
+    trigger_period: int | None = None,
+) -> list[str]:
+    cmd = conda_python(args) + [
+        entry_script("ddim_cifar_siec.py"),
+        "--correction-mode", correction_mode,
+        "--num_samples", str(args.num_samples),
+        "--sample_batch", str(args.sample_batch),
+        "--weight_bit", "8",
+        "--act_bit", "8",
+        "--replicate_interval", "10",
+        "--image_folder", rel(image_folder),
+        "--siec_max_rounds", str(args.siec_max_rounds),
+        "--siec_return_trace",
+        "--siec_trace_mode", correction_mode,
+        "--siec_trace_out", rel(trace_path_),
+    ]
+    if tau_percentile is not None:
+        cmd += [
+            "--tau_path", rel(tau_path(tau_percentile)),
+            "--tau_percentile", str(tau_percentile),
+        ]
+    if always_correct:
+        cmd.append("--siec_always_correct")
+    if trigger_mode is not None:
+        cmd += ["--trigger_mode", trigger_mode]
+    if trigger_prob is not None:
+        cmd += ["--trigger_prob", f"{trigger_prob:.8f}"]
+    if trigger_period is not None:
+        cmd += ["--trigger_period", str(trigger_period)]
+    return cmd
+
+
+def attach_runtime_targets(args, row: dict, slug: str, correction_mode: str, **cmd_kwargs) -> None:
+    image_folder = CIFAR_IMAGE_DIR / f"image_tradeoff_{slug}_n{args.num_samples}"
+    trace_path_ = args.results_dir / "traces" / f"{slug}.pt"
+    npz_path = args.results_dir / f"samples_{slug}_n{args.num_samples}.npz"
+    sampling_log = args.results_dir / "logs" / f"sampling_{slug}.log"
+    fid_log = args.results_dir / "logs" / f"fid_{slug}.log"
+    row["_slug"] = slug
+    row["_image_folder"] = image_folder
+    row["_trace"] = trace_path_
+    row["_npz"] = npz_path
+    row["_sampling_log"] = sampling_log
+    row["_fid_log"] = fid_log
+    row["trace_path"] = rel(trace_path_)
+    row["source_npz"] = rel(npz_path)
+    row["source_log"] = rel(fid_log)
+    row["_cmd"] = build_sampling_cmd(args, correction_mode, image_folder, trace_path_, **cmd_kwargs)
+    row["_needs_run"] = not trace_path_.exists() or (not npz_path.exists() and png_count(image_folder) < args.num_samples)
+
+
+def build_rows(args, cmd_sink: list[list[str]]) -> list[dict]:
+    rows: list[dict] = []
+
+    row = make_base_row("no_correction", "No correction", args.num_samples, notes="W8A8 + DeepCache deployed path; correction disabled")
+    attach_runtime_targets(args, row, "no_correction", "none")
+    if row["_needs_run"]:
+        cmd_sink.append(row["_cmd"])
+    rows.append(row)
+
+    row = make_base_row("tac", "TAC", args.num_samples, notes="TAC skeleton only")
+    row["status"] = "blocked"
+    row["blocked_reason"] = "TAC not implemented"
+    rows.append(row)
+
+    row = make_base_row("iec", "IEC", args.num_samples, notes="fresh 2K IEC baseline")
+    attach_runtime_targets(args, row, "iec", "iec")
+    if row["_needs_run"]:
+        cmd_sink.append(row["_cmd"])
+    rows.append(row)
+
+    row = make_base_row("always_on", "Naive always-on refinement", args.num_samples, notes="S-IEC always-correct ablation")
+    attach_runtime_targets(args, row, "always_on", "siec", always_correct=True)
+    if row["_needs_run"]:
+        cmd_sink.append(row["_cmd"])
+    rows.append(row)
+
+    for percentile in args.percentiles:
+        row = make_base_row("siec", f"S-IEC p{percentile}", args.num_samples, notes="tau sweep")
+        row["tau_percentile"] = percentile
+        attach_runtime_targets(args, row, f"siec_p{percentile}", "siec", tau_percentile=percentile)
+        if row["_needs_run"]:
+            cmd_sink.append(row["_cmd"])
+        rows.append(row)
+
+    match_percentile = 80
+    target_rate = pilot_trigger_rate(match_percentile)
+    if target_rate is None:
+        random_row = make_base_row("random", f"Random trigger (matched to p{match_percentile})", args.num_samples)
+        random_row["status"] = "blocked"
+        random_row["blocked_reason"] = f"tau schedule missing for p{match_percentile}"
+        rows.append(random_row)
+
+        uniform_row = make_base_row("uniform", f"Uniform periodic (matched to p{match_percentile})", args.num_samples)
+        uniform_row["status"] = "blocked"
+        uniform_row["blocked_reason"] = f"tau schedule missing for p{match_percentile}"
+        rows.append(uniform_row)
+    else:
+        random_row = make_base_row(
+            "random",
+            f"Random trigger (matched to p{match_percentile})",
+            args.num_samples,
+            notes=f"expected trigger rate from pilot/tau = {target_rate:.4f}",
+        )
+        attach_runtime_targets(
+            args,
+            random_row,
+            f"random_matched_p{match_percentile}",
+            "siec",
+            trigger_mode="random",
+            trigger_prob=target_rate,
+            trigger_period=5,
+        )
+        if random_row["_needs_run"]:
+            cmd_sink.append(random_row["_cmd"])
+        rows.append(random_row)
+
+        period = max(1, int(round(1.0 / max(target_rate, 1e-8))))
+        realized = 1.0 / period
+        uniform_row = make_base_row(
+            "uniform",
+            f"Uniform periodic (matched to p{match_percentile})",
+            args.num_samples,
+            notes=f"target rate={target_rate:.4f}, realized periodic rate={realized:.4f}",
+        )
+        attach_runtime_targets(
+            args,
+            uniform_row,
+            f"uniform_matched_p{match_percentile}_period{period}",
+            "siec",
+            trigger_mode="uniform",
+            trigger_prob=0.0,
+            trigger_period=period,
+        )
+        if uniform_row["_needs_run"]:
+            cmd_sink.append(uniform_row["_cmd"])
+        rows.append(uniform_row)
+
+    return rows
+
+
+def aggregate_trace(trace_path_: Path) -> dict:
+    import torch
+
+    traces = torch.load(trace_path_, weights_only=False, map_location="cpu")
+    if isinstance(traces, dict):
+        traces = [traces]
+    total_weight = 0
+    total_nfe = 0.0
+    total_triggered = 0.0
+    total_checked = 0.0
+    syndrome_values: list[float] = []
+    step_score_values: list[list[float]] = []
+    for trace in traces:
+        batch_size = int(trace.get("batch_size", 1))
+        total_weight += batch_size
+        total_nfe += batch_size * float(sum(trace.get("nfe_per_step", [])))
+        checked = trace.get("checked_per_step", [])
+        triggered = trace.get("triggered_per_step", [])
+        total_checked += batch_size * sum(1 for flag in checked if flag)
+        total_triggered += batch_size * sum(
+            1 for check, flag in zip(checked, triggered) if check and flag
+        )
+        for step_idx, values in enumerate(trace.get("score_values_per_step", [])):
+            while len(step_score_values) <= step_idx:
+                step_score_values.append([])
+            step_values = [float(v) for v in values]
+            step_score_values[step_idx].extend(step_values)
+            syndrome_values.extend(float(v) for v in values)
+    trigger_rate = (total_triggered / total_checked) if total_checked else 0.0
+    syndrome_mean = (sum(syndrome_values) / len(syndrome_values)) if syndrome_values else None
+    return {
+        "per_sample_nfe": (total_nfe / total_weight) if total_weight else None,
+        "trigger_rate": trigger_rate,
+        "syndrome_mean": syndrome_mean,
+        "syndrome_values": syndrome_values,
+        "step_score_values": step_score_values,
+    }
+
+
+def write_syndrome_artifacts(values: list[float], step_values: list[list[float]], results_dir: Path, slug: str) -> None:
+    if not values and not any(step_values):
         return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    artifacts = results_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "count": len(values),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
+        "min": float(np.min(values)),
+        "median": float(np.median(values)),
+        "p90": float(np.percentile(values, 90)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(np.max(values)),
+    }
+    (artifacts / f"syndrome_summary_{slug}.json").write_text(json.dumps(summary, indent=2))
+
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    ax.hist(values, bins=min(40, max(10, len(values) // 20)), color="tab:blue", alpha=0.85)
+    ax.set_xlabel("Syndrome score")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Syndrome Distribution: {slug}")
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(artifacts / f"syndrome_hist_{slug}.png", dpi=150)
+    plt.close(fig)
+
+    if not any(step_values):
+        return
+
+    step_summary = []
+    for step_idx, vals in enumerate(step_values):
+        arr = np.asarray(vals, dtype=float)
+        if arr.size == 0:
+            step_summary.append(
+                {
+                    "step": step_idx,
+                    "count": 0,
+                    "mean": None,
+                    "median": None,
+                    "p10": None,
+                    "p90": None,
+                    "min": None,
+                    "max": None,
+                }
+            )
+            continue
+        step_summary.append(
+            {
+                "step": step_idx,
+                "count": int(arr.size),
+                "mean": float(np.mean(arr)),
+                "median": float(np.median(arr)),
+                "p10": float(np.percentile(arr, 10)),
+                "p90": float(np.percentile(arr, 90)),
+                "min": float(np.min(arr)),
+                "max": float(np.max(arr)),
+            }
+        )
+    (artifacts / f"syndrome_timestep_summary_{slug}.json").write_text(json.dumps(step_summary, indent=2))
+
+    xs = [item["step"] for item in step_summary if item["count"] > 0]
+    means = [item["mean"] for item in step_summary if item["count"] > 0]
+    medians = [item["median"] for item in step_summary if item["count"] > 0]
+    p10s = [item["p10"] for item in step_summary if item["count"] > 0]
+    p90s = [item["p90"] for item in step_summary if item["count"] > 0]
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    ax.fill_between(xs, p10s, p90s, color="#9ecae1", alpha=0.35, label="p10-p90")
+    ax.plot(xs, means, color="#1f77b4", linewidth=2.0, label="mean")
+    ax.plot(xs, medians, color="#d62728", linewidth=1.6, linestyle="--", label="median")
+    ax.set_xlabel("Reverse timestep index")
+    ax.set_ylabel("Syndrome score")
+    ax.set_title(f"Per-step Syndrome Distribution: {slug}")
+    ax.grid(alpha=0.22)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(artifacts / f"syndrome_timestep_{slug}.png", dpi=150)
+    fig.savefig(artifacts / f"syndrome_timestep_{slug}.pdf")
+    plt.close(fig)
+
+
+def update_row_from_trace(row: dict, results_dir: Path) -> None:
+    trace_path_ = row.get("_trace")
+    if trace_path_ is None or not trace_path_.exists():
+        return
+    metrics = aggregate_trace(trace_path_)
+    row["per_sample_nfe"] = metrics["per_sample_nfe"]
+    row["trigger_rate"] = metrics["trigger_rate"]
+    row["syndrome_mean"] = metrics["syndrome_mean"]
+    if row.get("num_samples") and row.get("per_sample_nfe") is not None:
+        row["nfe_total"] = row["num_samples"] * row["per_sample_nfe"]
+    write_syndrome_artifacts(metrics["syndrome_values"], metrics["step_score_values"], results_dir, row["_slug"])
+
+
+def attach_loaded_trace_metadata(rows: list[dict]) -> None:
     for row in rows:
-        folder = row["_image_folder"]
-        npz = row["_npz"]
-        if not npz.exists():
-            if png_count(folder) == 0:
-                row["notes"] = (row.get("notes") or "") + "; sampling output missing"
+        trace_rel = row.get("trace_path")
+        if not trace_rel:
+            continue
+        trace_abs = IEC_ROOT / str(trace_rel)
+        row["_trace"] = trace_abs
+        row["_slug"] = trace_abs.stem
+
+
+def run_rows(rows: list[dict], args) -> None:
+    for row in rows:
+        if row.get("status") == "blocked" or row.get("_cmd") is None:
+            continue
+        if not args.skip_sampling and row.get("_needs_run"):
+            row["sampling_wall_clock_sec"] = run_cmd(row["_cmd"], row["_sampling_log"])
+        update_row_from_trace(row, args.results_dir)
+        if args.skip_fid:
+            if row.get("sampling_wall_clock_sec") is not None:
+                row["total_wall_clock_sec"] = row["sampling_wall_clock_sec"]
+            continue
+        npz_path = row["_npz"]
+        image_folder = row["_image_folder"]
+        if not npz_path.exists():
+            if png_count(image_folder) == 0:
+                row["notes"] = ((row.get("notes") or "") + "; sampling output missing").lstrip("; ")
                 continue
-            pngs_to_npz(folder, npz)
-        fid_log = args.results_dir / "logs" / f"fid_{row['method'].replace(' ', '_')}.log"
-        fid, sfid = parse_fid_log(fid_log) if fid_log.exists() else run_fid(npz, fid_log)
-        row["fid"] = fid
-        row["sfid"] = sfid
-        row["source_log"] = rel(fid_log)
-        row["source_npz"] = rel(npz)
+            pngs_to_npz(image_folder, npz_path)
+        fid_log = row["_fid_log"]
+        if fid_log.exists():
+            fid, sfid = parse_fid_log(fid_log)
+            row["fid"] = fid
+            row["sfid"] = sfid
+            row["fid_wall_clock_sec"] = 0.0
+        else:
+            fid, sfid, fid_elapsed = run_fid(args, npz_path, fid_log)
+            row["fid"] = fid
+            row["sfid"] = sfid
+            row["fid_wall_clock_sec"] = fid_elapsed
+        row["total_wall_clock_sec"] = sum(
+            v for v in [row.get("sampling_wall_clock_sec"), row.get("fid_wall_clock_sec")] if v is not None
+        ) or None
+        if row.get("fid") is not None and row.get("per_sample_nfe") is not None:
+            row["status"] = "completed"
 
 
 def save_results(rows: list[dict], results_dir: Path) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
-    clean = [{k: r.get(k) for k in CSV_KEYS} for r in rows]
+    clean = [{k: row.get(k) for k in CSV_KEYS} for row in rows]
     with open(results_dir / "results.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_KEYS)
         writer.writeheader()
@@ -589,71 +596,179 @@ def write_commands(cmds: list[list[str]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write("#!/usr/bin/env bash\n")
-        f.write("# Generated by real_04_tradeoff.py — review before running.\n")
+        f.write("# Generated by real_04_tradeoff.py\n")
         f.write(f"cd {IEC_ROOT}\n\n")
         for cmd in cmds:
             f.write(shlex.join(cmd) + "\n")
     path.chmod(0o755)
 
 
+def completed_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if row.get("fid") is not None and row.get("per_sample_nfe") is not None]
+
+
 def plot_two_panel(rows: list[dict], out_png: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FormatStrFormatter
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    ready = completed_rows(rows)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5))
+    fig.patch.set_facecolor("white")
 
-    siec = sorted(
-        [r for r in rows if r.get("method", "").startswith("S-IEC p")
-         and r.get("fid") is not None and r.get("per_sample_nfe") is not None
-         and r.get("tau_percentile") is not None],
+    for ax in axes:
+        ax.set_facecolor("#fcfcfc")
+        ax.grid(alpha=0.22, linewidth=0.8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    siec_rows = sorted(
+        [r for r in ready if r["method_key"] == "siec" and r.get("tau_percentile") is not None],
         key=lambda r: r["tau_percentile"],
     )
-    if siec:
-        xs = [r["per_sample_nfe"] for r in siec]
-        ys = [r["fid"] for r in siec]
-        axes[0].plot(xs, ys, "o-", color="tab:blue", label="S-IEC τ sweep")
-        for x, y, p in zip(xs, ys, [r["tau_percentile"] for r in siec]):
-            axes[0].annotate(f"p{p}", (x, y), textcoords="offset points",
-                             xytext=(5, 5), fontsize=8)
+    if siec_rows:
+        xs = [r["per_sample_nfe"] for r in siec_rows]
+        ys = [r["fid"] for r in siec_rows]
+        axes[0].plot(
+            xs, ys, "o-", color="#1f77b4", linewidth=2.2, markersize=7,
+            markerfacecolor="white", markeredgewidth=1.8, label="S-IEC tau sweep"
+        )
+        axes[1].plot(
+            [r["trigger_rate"] for r in siec_rows], ys, "o-", color="#1f77b4",
+            linewidth=2.2, markersize=7, markerfacecolor="white",
+            markeredgewidth=1.8, label="S-IEC tau sweep"
+        )
+        for row in siec_rows:
+            axes[0].annotate(
+                f"p{row['tau_percentile']}",
+                (row["per_sample_nfe"], row["fid"]),
+                textcoords="offset points",
+                xytext=(6, 6),
+                fontsize=8,
+                color="#1f77b4",
+            )
+            axes[1].annotate(
+                f"p{row['tau_percentile']}",
+                (row["trigger_rate"], row["fid"]),
+                textcoords="offset points",
+                xytext=(6, 6),
+                fontsize=8,
+                color="#1f77b4",
+            )
 
-    markers = {
-        "IEC (author)": ("s", "tab:orange", "IEC"),
-        "IEC+Recon": ("D", "tab:brown", "IEC+Recon"),
-        "S-IEC always-on": ("^", "tab:red", "Always-on"),
-        "No correction (never)": ("v", "tab:gray", "No correction"),
-        "S-IEC p80 (seed 50K)": ("*", "tab:green", "S-IEC p80 (50K seed)"),
+    baseline_specs = {
+        "no_correction": ("D", "#7f7f7f", "No correction"),
+        "iec": ("s", "#ff7f0e", "IEC"),
+        "always_on": ("^", "#d62728", "Naive always-on refinement"),
     }
-    for r in rows:
-        spec = markers.get(r["method"])
-        if spec is None or r.get("fid") is None or r.get("per_sample_nfe") is None:
+    drawn = set()
+    baseline_lookup = {}
+    for row in ready:
+        spec = baseline_specs.get(row["method_key"])
+        if spec is None:
             continue
         marker, color, label = spec
-        axes[0].scatter([r["per_sample_nfe"]], [r["fid"]],
-                        marker=marker, s=90, color=color, label=label)
+        legend_label = label if label not in drawn else None
+        drawn.add(label)
+        axes[0].scatter(
+            [row["per_sample_nfe"]], [row["fid"]],
+            marker=marker, s=110, color=color, edgecolors="white",
+            linewidths=0.9, zorder=4, label=legend_label
+        )
+        axes[1].scatter(
+            [row["trigger_rate"]], [row["fid"]],
+            marker=marker, s=110, color=color, edgecolors="white",
+            linewidths=0.9, zorder=4, label=legend_label
+        )
+        baseline_lookup[row["method_key"]] = row
+
+    matched_styles = (
+        ("random", "#2ca02c", "X", "Random trigger"),
+        ("uniform", "#9467bd", "P", "Uniform periodic"),
+    )
+    for method_key, color, marker, label in matched_styles:
+        items = [r for r in ready if r["method_key"] == method_key]
+        if not items:
+            continue
+        items_by_nfe = sorted(items, key=lambda r: r["per_sample_nfe"])
+        items_by_trigger = sorted(items, key=lambda r: r["trigger_rate"])
+        axes[0].plot(
+            [r["per_sample_nfe"] for r in items_by_nfe],
+            [r["fid"] for r in items_by_nfe],
+            linestyle="--", linewidth=1.4, alpha=0.65, color=color,
+        )
+        axes[0].scatter(
+            [r["per_sample_nfe"] for r in items],
+            [r["fid"] for r in items],
+            color=color, marker=marker, s=70, alpha=0.9, label=label
+        )
+        axes[1].plot(
+            [r["trigger_rate"] for r in items_by_trigger],
+            [r["fid"] for r in items_by_trigger],
+            linestyle="--", linewidth=1.4, alpha=0.65, color=color,
+        )
+        axes[1].scatter(
+            [r["trigger_rate"] for r in items],
+            [r["fid"] for r in items],
+            color=color, marker=marker, s=70, alpha=0.9, label=label
+        )
+
+    iec_row = baseline_lookup.get("iec")
+    if iec_row is not None:
+        for ax in axes:
+            ax.axhline(iec_row["fid"], color="#ff7f0e", linestyle=":", linewidth=1.3, alpha=0.8)
+        axes[0].axvline(iec_row["per_sample_nfe"], color="#ff7f0e", linestyle=":", linewidth=1.3, alpha=0.8)
+        axes[1].axvline(iec_row["trigger_rate"], color="#ff7f0e", linestyle=":", linewidth=1.3, alpha=0.8)
+        axes[0].annotate(
+            "IEC reference",
+            (iec_row["per_sample_nfe"], iec_row["fid"]),
+            textcoords="offset points",
+            xytext=(8, -14),
+            fontsize=9,
+            color="#b35a00",
+        )
+        axes[1].annotate(
+            "IEC reference",
+            (iec_row["trigger_rate"], iec_row["fid"]),
+            textcoords="offset points",
+            xytext=(8, -14),
+            fontsize=9,
+            color="#b35a00",
+        )
+
+    if ready:
+        fids = [r["fid"] for r in ready if r.get("fid") is not None]
+        if fids:
+            y_min, y_max = min(fids), max(fids)
+            pad = max(0.15, 0.12 * (y_max - y_min))
+            for ax in axes:
+                ax.set_ylim(y_min - pad, y_max + pad)
+
     axes[0].set_xlabel("Per-sample NFE")
     axes[0].set_ylabel("FID")
-    axes[0].set_title("Compute-Quality Tradeoff")
-    axes[0].grid(alpha=0.3)
-    axes[0].legend(fontsize=8)
+    axes[0].set_title("Compute vs Quality", fontsize=13, weight="bold")
+    axes[0].xaxis.set_major_formatter(FormatStrFormatter("%.0f"))
 
-    trig = [r for r in rows if r.get("method", "").startswith("S-IEC p")
-            and r.get("trigger_rate") is not None and r.get("fid") is not None]
-    if trig:
-        xs = [r["trigger_rate"] for r in trig]
-        ys = [r["fid"] for r in trig]
-        axes[1].scatter(xs, ys, color="tab:blue")
-        for x, y, p in zip(xs, ys, [r["tau_percentile"] for r in trig]):
-            if p is None:
-                continue
-            axes[1].annotate(f"p{p}", (x, y), textcoords="offset points",
-                             xytext=(5, 5), fontsize=8)
-    axes[1].set_xlabel("Mean trigger rate")
+    axes[1].set_xlabel("Trigger rate")
     axes[1].set_ylabel("FID")
-    axes[1].set_title("Trigger Rate vs Quality (τ as control knob)")
-    axes[1].grid(alpha=0.3)
+    axes[1].set_title("Selectivity vs Quality", fontsize=13, weight="bold")
+    axes[1].xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+    axes[1].set_xlim(-0.03, 1.03)
 
-    fig.tight_layout()
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=3,
+        frameon=False,
+        fontsize=9,
+    )
+
+    fig.suptitle("Experiment 4: Tradeoff Under W8A8 + DeepCache", fontsize=15, weight="bold", y=1.06)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=150)
     fig.savefig(out_png.with_suffix(".pdf"))
@@ -661,29 +776,40 @@ def plot_two_panel(rows: list[dict], out_png: Path) -> None:
 
 
 def write_compute_matched(rows: list[dict], out_md: Path) -> None:
-    iec = next((r for r in rows if r["method"] == "IEC (author)"), None)
-    siec = [r for r in rows if r.get("method", "").startswith("S-IEC p")
-            and r.get("per_sample_nfe") is not None and r.get("fid") is not None]
-    if iec is None or iec.get("per_sample_nfe") is None or not siec:
-        out_md.parent.mkdir(parents=True, exist_ok=True)
-        out_md.write_text("# Compute-Matched Row\n\nNot enough data yet.\n")
+    ready = completed_rows(rows)
+    iec = next(
+        (
+            row
+            for row in ready
+            if row["method_key"] == "iec" and row.get("num_samples") is not None
+        ),
+        None,
+    )
+    if iec is None:
+        out_md.write_text("# Compute-Matched Row\n\nIEC row is not completed yet.\n")
         return
-    matched = min(siec, key=lambda r: abs(r["per_sample_nfe"] - iec["per_sample_nfe"]))
+    candidates = [
+        row for row in ready
+        if row["method_key"] == "siec" and row.get("num_samples") == iec.get("num_samples")
+    ]
+    if not candidates:
+        out_md.write_text("# Compute-Matched Row\n\nS-IEC sweep rows are not completed yet.\n")
+        return
+    matched = min(candidates, key=lambda row: abs(row["per_sample_nfe"] - iec["per_sample_nfe"]))
 
-    def fmt(v, places=4):
-        return "—" if v is None else f"{v:.{places}f}"
+    def fmt(value, places=4):
+        return "—" if value is None else f"{value:.{places}f}"
 
     lines = [
         "# Compute-Matched Row (real_04_tradeoff)",
         "",
-        f"IEC per-sample NFE = {iec['per_sample_nfe']:.2f}. Nearest S-IEC point:",
+        f"reference_method = `{iec['method_key']}`",
+        f"num_samples = {iec['num_samples']}",
         "",
         "| Method | FID | sFID | per_sample_NFE | trigger_rate |",
         "|---|---|---|---|---|",
-        f"| {iec['method']} | {fmt(iec['fid'])} | {fmt(iec['sfid'])} "
-        f"| {iec['per_sample_nfe']:.2f} | 0.0000 |",
-        f"| {matched['method']} | {fmt(matched['fid'])} | {fmt(matched['sfid'])} "
-        f"| {matched['per_sample_nfe']:.2f} | {fmt(matched['trigger_rate'])} |",
+        f"| {iec['method']} | {fmt(iec['fid'])} | {fmt(iec['sfid'])} | {fmt(iec['per_sample_nfe'], 2)} | {fmt(iec['trigger_rate'])} |",
+        f"| {matched['method']} | {fmt(matched['fid'])} | {fmt(matched['sfid'])} | {fmt(matched['per_sample_nfe'], 2)} | {fmt(matched['trigger_rate'])} |",
         "",
     ]
     out_md.parent.mkdir(parents=True, exist_ok=True)
@@ -694,54 +820,53 @@ def load_csv_rows(path: Path) -> list[dict]:
     with open(path) as f:
         raw = list(csv.DictReader(f))
 
-    def cast(v):
-        if v in (None, "", "None"):
+    def cast(value):
+        if value in ("", "None", None):
             return None
+        if value == "True":
+            return True
+        if value == "False":
+            return False
         try:
-            return float(v) if "." in v else int(v)
+            return float(value) if "." in value else int(value)
         except ValueError:
-            return v
+            return value
 
-    rows = []
-    for r in raw:
-        rows.append({k: cast(v) for k, v in r.items()})
-    return rows
+    return [{k: cast(v) for k, v in row.items()} for row in raw]
 
 
 def main() -> None:
     args = parse_args()
+    args.results_dir = resolve_results_dir(args.results_dir, plot_only=args.plot_only)
     args.results_dir.mkdir(parents=True, exist_ok=True)
 
     if args.plot_only:
         rows = load_csv_rows(args.results_dir / "results.csv")
+        attach_loaded_trace_metadata(rows)
+        for row in rows:
+            update_row_from_trace(row, args.results_dir)
         plot_two_panel(rows, args.results_dir / "tradeoff_2panel.png")
         write_compute_matched(rows, args.results_dir / "compute_matched.md")
-        print(f"Replotted {len(rows)} rows → {args.results_dir}")
+        print(f"Replotted {len(rows)} rows -> {args.results_dir}")
         return
 
     cmd_list: list[list[str]] = []
     if not args.skip_tau_calibration:
         ensure_tau_schedules(args, cmd_list)
-    sweep = build_sweep_rows(args, cmd_list)
-
-    all_rows = seed_rows() + sweep
-    fill_postmortem(all_rows, args)
+    rows = build_rows(args, cmd_list)
     write_commands(cmd_list, args.results_dir / "commands.sh")
 
-    if args.dry_run:
-        save_results(all_rows, args.results_dir)
-        print(f"Dry-run: {len(cmd_list)} commands → {args.results_dir/'commands.sh'}")
-        print(f"         rows={len(all_rows)} (csv/json written for inspection)")
-        missing_tau = [p for p in args.percentiles if not tau_path(p).exists()]
-        if missing_tau:
-            print(f"         missing tau schedules: {missing_tau}")
-        return
+    if not args.dry_run:
+        run_rows(rows, args)
+        plot_two_panel(rows, args.results_dir / "tradeoff_2panel.png")
+        write_compute_matched(rows, args.results_dir / "compute_matched.md")
 
-    execute_sweep(sweep, args)
-    save_results(all_rows, args.results_dir)
-    plot_two_panel(all_rows, args.results_dir / "tradeoff_2panel.png")
-    write_compute_matched(all_rows, args.results_dir / "compute_matched.md")
-    print(f"Done. Results in {args.results_dir}")
+    save_results(rows, args.results_dir)
+    if args.dry_run:
+        print(f"Dry-run: {len(cmd_list)} commands -> {args.results_dir / 'commands.sh'}")
+        print(f"         rows={len(rows)}")
+    else:
+        print(f"Done. Results in {args.results_dir}")
 
 
 if __name__ == "__main__":

@@ -344,9 +344,8 @@ def adaptive_generalized_steps_siec(
     Follows Prof's toy SIEC.correct_step structure as closely as possible,
     adapted for IEC's DeepCache + CacheQuant pipeline.
     
-    Design choice: syndrome check is performed at every reverse timestep,
-    matching Algorithm 1 of the paper. DeepCache interval_seq is used only
-    for the model/cache forward path, not for deciding whether to check/correct.
+    Design choice: syndrome check only at interval_seq positions
+    (DeepCache refresh points), to preserve IEC's compute structure.
     
     Correction loop mirrors toy SIEC.correct_step:
       for _ in range(max_rounds):
@@ -416,12 +415,9 @@ def adaptive_generalized_steps_siec(
             xt_next_hat = xt_next_tent
 
             # ============================================
-            # Step 3~5: S-IEC syndrome check at every timestep
+            # Step 3~5: S-IEC syndrome check (only at interval_seq)
             # ============================================
-            # Algorithm 1 checks the tentative transition at every reverse step.
-            # interval_seq still controls DeepCache refresh vs reuse above,
-            # but it no longer gates syndrome checking/correction.
-            do_siec_check = (next_t.long()[0].item() >= 0)
+            do_siec_check = (cur_i in interval_seq) and (next_t.long()[0].item() >= 0)
             batch_score_value = 0.0
             triggered = False
 
@@ -590,9 +586,7 @@ def adaptive_generalized_steps_trace(
             batch_score = 0.0
             triggered = False
             
-            # Algorithm-1 style: measure syndrome at every timestep.
-            # interval_seq is not used to restrict the syndrome check.
-            do_lookahead = (next_t.long()[0].item() >= 0)
+            do_lookahead = (cur_i in interval_seq) and (next_t.long()[0].item() >= 0)
             
             if do_lookahead:
                 # lookahead forward
@@ -668,8 +662,8 @@ def adaptive_generalized_steps_trace(
                                 if tau_schedule is not None and new_score_val <= tau_t:
                                     break
             
-            # If not triggered, accept the tentative DDIM transition.
-            # xt_next_hat is already xt_next_tent.
+            # non interval_seq 위치: 그냥 DDIM (baseline iec/no-correction)
+            # no-op, xt_next_hat은 이미 tentative
             
             syndrome_per_step.append(batch_score)
             triggered_per_step.append(triggered)

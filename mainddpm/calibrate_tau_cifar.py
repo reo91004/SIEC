@@ -26,7 +26,13 @@ def main():
         args.out_path = f"./calibration/tau_schedule_p{int(args.percentile)}.pt"
 
     print(f"Loading pilot scores from: {args.scores_path}")
-    scores_by_t = torch.load(args.scores_path)
+    raw_scores = torch.load(args.scores_path, weights_only=False)
+    if isinstance(raw_scores, dict):
+        scores_by_t = raw_scores.get("scores_by_t")
+        if scores_by_t is None:
+            raise ValueError(f"{args.scores_path} is missing 'scores_by_t'")
+    else:
+        scores_by_t = raw_scores
     T = len(scores_by_t)
     print(f"Loaded scores for {T} timesteps")
     print(f"  per-timestep sample counts: "

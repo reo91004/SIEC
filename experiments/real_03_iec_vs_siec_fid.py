@@ -130,7 +130,7 @@ def make_comparison_grid(npz_dict, n_show=8, seed=42):
 
     plt.suptitle("Sample Comparison (same indices)", fontsize=12, y=1.01)
     plt.tight_layout()
-    out_path = SAVE_DIR / "iec_vs_siec_samples.png"
+    out_path = SAVE_DIR / "jowithu" / "iec_vs_siec_samples.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Sample grid saved to {out_path}")
@@ -304,13 +304,13 @@ def main():
     # ─── Visualization ────────────────────────────────────────────────
     if not args.skip_plot:
         print("\n[4/4] Generating visualizations...")
-        plot_fid_comparison(results, SAVE_DIR / "iec_vs_siec_fid.png")
+        plot_fid_comparison(results, SAVE_DIR / "jowithu" / "iec_vs_siec_fid.png")
         make_comparison_grid(npz_dict)
     else:
         print("\n[4/4] Skipping visualization (--skip_plot)")
 
     # ─── Save results to text ─────────────────────────────────────────
-    results_path = SAVE_DIR / "iec_vs_siec_fid_results.txt"
+    results_path = SAVE_DIR / "jowithu" /"iec_vs_siec_fid_results.txt"
     with open(results_path, "w") as f:
         f.write("IEC vs S-IEC FID Comparison\n")
         f.write(f"Samples per method: {max_n or 'all (50K)'}\n\n")

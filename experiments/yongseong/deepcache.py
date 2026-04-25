@@ -105,11 +105,13 @@ class Diffusion(object):
             from ddpm.models.deepcache_diffusion import Model
             model = Model(self.config)
             model.set_cache_para(self.args.branch)
+            model._exp_backend = "deepcache"
             logger.info('Sampling in DeepCache mode')
         else:
             # [EXP-C4] fp16 / 양자화 off 비교용 non-cache 경로 (실험 5 Setting 1).
             from ddpm.models.diffusion import Model
             model = Model(self.config)
+            model._exp_backend = "plain"
             logger.info('Sampling in non-DeepCache (fp16) mode')
 
         if self.config.data.dataset == "CIFAR10":
@@ -258,17 +260,19 @@ class Diffusion(object):
             else:
                 raise NotImplementedError
 
+            correction_mode = getattr(self.args, "correction_mode", None)
+            if not correction_mode or correction_mode == "auto":
+                correction_mode = "siec" if getattr(self.args, "use_siec", False) else "iec"
+
             if self.interval_seq == None:
                 # [EXP-C4] interval_seq 가 없으면 S-IEC lookahead 경로가 동작하지 않는다.
                 # S-IEC 를 요구하는 run 이 이 분기로 들어오면 silent 하게 IEC 로 fallback 되지
                 # 않도록 명시적으로 막는다. (fp16 S-IEC 는 별도 sampler 필요)
-                if getattr(self.args, 'use_siec', False) and not getattr(
-                    self.args, 'siec_always_correct', False
-                ):
+                if correction_mode not in ("none",):
                     raise NotImplementedError(
-                        "[EXP-C4] fp16 / no-cache path does not support S-IEC "
-                        "(interval_seq=None). Use --no-use-siec for IEC-only fresh run, "
-                        "or run with DeepCache enabled."
+                        "[EXP] correction_mode requires interval_seq-backed sampling. "
+                        "Use the experimental copy with DeepCache calibration loaded, or "
+                        "switch to correction_mode=none."
                     )
                 from deepcache_denoising import generalized_steps
                 xs = generalized_steps(
@@ -279,65 +283,77 @@ class Diffusion(object):
                     center=self.args.center, branch=self.args.branch,
                     eta=self.args.eta)
             else:
-                # ★ S-IEC branch
-                if getattr(self.args, 'use_siec', False):
-                    # [EXP-C3] Trace API 경로: NFE/trigger 직접 측정.
-                    if getattr(self.args, 'siec_return_trace', False):
-                        from deepcache_denoising import adaptive_generalized_steps_trace
-                        result = adaptive_generalized_steps_trace(
-                            x, seq, model, self.betas,
-                            timesteps=timesteps,
-                            interval_seq=self.interval_seq,
-                            branch=self.args.branch,
-                            eta=self.args.eta,
-                            quant=self.args.ptq,
-                            mode=getattr(self.args, 'siec_trace_mode', 'siec'),
-                            c_siec=getattr(self.args, 'c_siec', 1.0),
-                            tau_schedule=getattr(self.args, 'tau_schedule', None),
-                            siec_always_correct=getattr(self.args, 'siec_always_correct', False),
-                            siec_max_rounds=getattr(self.args, 'siec_max_rounds', 1),
-                        )
-                        xs_list, x0_preds_list, trace = result
-                        if not hasattr(self.args, '_siec_traces'):
-                            self.args._siec_traces = []
-                        self.args._siec_traces.append(trace)
-                        xs = (xs_list, x0_preds_list)
-                    else:
-                        from deepcache_denoising import adaptive_generalized_steps_siec
-                        result = adaptive_generalized_steps_siec(
-                            x, seq, model, self.betas,
-                            timesteps=timesteps,
-                            interval_seq=self.interval_seq,
-                            branch=self.args.branch,
-                            eta=self.args.eta,
-                            quant=self.args.ptq,
-                            c_siec=getattr(self.args, 'c_siec', 1.0),
-                            tau_schedule=getattr(self.args, 'tau_schedule', None),
-                            siec_always_correct=getattr(self.args, 'siec_always_correct', False),
-                            siec_collect_scores=getattr(self.args, 'siec_collect_scores', False),
-                            siec_max_rounds=getattr(self.args, 'siec_max_rounds', 1),
-                            # [EXP-C1] 실험 4 트리거 모드 베이스라인.
-                            trigger_mode=getattr(self.args, 'trigger_mode', 'syndrome'),
-                            trigger_prob=getattr(self.args, 'trigger_prob', 0.2),
-                            trigger_period=getattr(self.args, 'trigger_period', 5),
-                        )
-                        # result is (xs, x0_preds) or (xs, x0_preds, scores)
-                        if getattr(self.args, 'siec_collect_scores', False) and len(result) == 3:
-                            xs_list, x0_preds_list, batch_scores = result
-                            if not hasattr(self.args, '_pilot_scores'):
-                                self.args._pilot_scores = []
-                            self.args._pilot_scores.append(batch_scores)
-                            xs = (xs_list, x0_preds_list)
-                        else:
-                            xs = result
-                else:
+                common_kwargs = dict(
+                    timesteps=timesteps,
+                    interval_seq=self.interval_seq,
+                    branch=self.args.branch,
+                    eta=self.args.eta,
+                    quant=self.args.ptq,
+                    disable_cache_reuse=getattr(self.args, "disable_cache_reuse", False),
+                )
+
+                if getattr(self.args, 'siec_return_trace', False):
+                    from deepcache_denoising import adaptive_generalized_steps_trace
+                    trace_mode = getattr(self.args, "siec_trace_mode", "auto")
+                    if trace_mode == "auto":
+                        trace_mode = correction_mode
+                    result = adaptive_generalized_steps_trace(
+                        x, seq, model, self.betas,
+                        mode=trace_mode,
+                        c_siec=getattr(self.args, 'c_siec', 1.0),
+                        tau_schedule=getattr(self.args, 'tau_schedule', None),
+                        siec_always_correct=getattr(self.args, 'siec_always_correct', False),
+                        siec_max_rounds=getattr(self.args, 'siec_max_rounds', 1),
+                        trigger_mode=getattr(self.args, 'trigger_mode', 'syndrome'),
+                        trigger_prob=getattr(self.args, 'trigger_prob', 0.2),
+                        trigger_period=getattr(self.args, 'trigger_period', 5),
+                        trace_include_x0=getattr(self.args, "trace_include_x0", False),
+                        **common_kwargs,
+                    )
+                    xs_list, x0_preds_list, trace = result
+                    if not hasattr(self.args, '_exp_traces'):
+                        self.args._exp_traces = []
+                    self.args._exp_traces.append(trace)
+                    xs = (xs_list, x0_preds_list)
+                elif correction_mode == "none":
+                    from deepcache_denoising import adaptive_generalized_steps_none
+                    xs = adaptive_generalized_steps_none(
+                        x, seq, model, self.betas, **common_kwargs
+                    )
+                elif correction_mode == "iec":
                     from deepcache_denoising import adaptive_generalized_steps_3
                     xs = adaptive_generalized_steps_3(
+                        x, seq, model, self.betas, **common_kwargs
+                    )
+                elif correction_mode == "siec":
+                    from deepcache_denoising import adaptive_generalized_steps_siec
+                    result = adaptive_generalized_steps_siec(
                         x, seq, model, self.betas,
-                        timesteps=timesteps,
-                        interval_seq=self.interval_seq, branch=self.args.branch,
-                        eta=self.args.eta,
-                        quant=self.args.ptq)
+                        c_siec=getattr(self.args, 'c_siec', 1.0),
+                        tau_schedule=getattr(self.args, 'tau_schedule', None),
+                        siec_always_correct=getattr(self.args, 'siec_always_correct', False),
+                        siec_collect_scores=getattr(self.args, 'siec_collect_scores', False),
+                        siec_max_rounds=getattr(self.args, 'siec_max_rounds', 1),
+                        trigger_mode=getattr(self.args, 'trigger_mode', 'syndrome'),
+                        trigger_prob=getattr(self.args, 'trigger_prob', 0.2),
+                        trigger_period=getattr(self.args, 'trigger_period', 5),
+                        **common_kwargs,
+                    )
+                    if getattr(self.args, 'siec_collect_scores', False) and len(result) == 3:
+                        xs_list, x0_preds_list, batch_scores = result
+                        if not hasattr(self.args, '_pilot_scores'):
+                            self.args._pilot_scores = []
+                        self.args._pilot_scores.append(batch_scores)
+                        xs = (xs_list, x0_preds_list)
+                    else:
+                        xs = result
+                elif correction_mode == "tac":
+                    from deepcache_denoising import adaptive_generalized_steps_tac
+                    xs = adaptive_generalized_steps_tac(
+                        x, seq, model, self.betas, **common_kwargs
+                    )
+                else:
+                    raise ValueError(f"unknown correction_mode: {correction_mode}")
             x = xs
         elif self.args.sample_type == "ddpm_noisy":
             # Not implemented for DeepCache

@@ -5,6 +5,12 @@ error_dec/cifar/image_siec_full_nb
 error_dec/cifar/image_siec_pilot_nb
 error_dec/cifar/image_siec_sanity_nb
 error_dec/cifar/siec_never
+error_dec/cifar/image*
+error_dec/cifar/siec*
+experiments/yongseong/results/real_04_tradeoff/*/artifacts
+experiments/yongseong/results/real_05_robustness/*/artifacts
+experiments/yongseong/results/real_04_tradeoff/20*
+experiments/yongseong/results/real_05_robustness/20*
 
 # datasets & large binaries
 calibration/

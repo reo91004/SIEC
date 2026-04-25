@@ -97,8 +97,8 @@ if __name__ == "__main__":
     parser.add_argument("--recon", action="store_true", default=False)
 
     # ========== S-IEC specific arguments ==========
-    parser.add_argument("--use_siec", action="store_true", default=True,
-                        help="Enable S-IEC (syndrome-guided correction)")
+    parser.add_argument("--use_siec", action=argparse.BooleanOptionalAction, default=True,
+                    help="Enable or disable S-IEC")
     parser.add_argument("--c_siec", type=float, default=1.0,
                         help="Correction gain multiplier (c in lambda = c*sigma^2/(alpha^2+sigma^2))")
     parser.add_argument("--tau_path", type=str,
@@ -268,6 +268,22 @@ if __name__ == "__main__":
             os.makedirs(os.path.dirname(args.siec_scores_out), exist_ok=True)
             torch.save(scores_by_t, args.siec_scores_out)
             logger.info(f"[S-IEC] Saved pilot scores to {args.siec_scores_out}")
+            
+            # Also convert pilot scores to tau schedule
+            tau = np.zeros(T, dtype=np.float64)
+            for t_idx in range(T):
+                if len(scores_by_t[t_idx]) > 0:
+                    tau[t_idx] = np.percentile(scores_by_t[t_idx], args.tau_percentile)
+
+            tau_out = args.tau_path
+            os.makedirs(os.path.dirname(tau_out), exist_ok=True)
+            torch.save(torch.from_numpy(tau).float(), tau_out)
+
+            logger.info(
+                f"[S-IEC] Saved tau schedule to {tau_out} "
+                f"(percentile={args.tau_percentile}, shape={tau.shape}, "
+                f"mean={tau.mean():.6f}, min={tau.min():.6f}, max={tau.max():.6f})"
+            )
         else:
             logger.warning("[S-IEC] Pilot mode but no scores collected!")
     # ===========================================================

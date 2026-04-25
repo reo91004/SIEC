@@ -62,6 +62,12 @@ def block_train_w(q_unet, args, kwargs, cali_data, t, cali_t, cache):
     torch.cuda.empty_cache()
 
 
+def normalize_correction_mode(args) -> str:
+    if args.correction_mode != "auto":
+        return args.correction_mode
+    return "siec" if args.use_siec else "iec"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=globals()["__doc__"])
     parser.add_argument("--config", type=str, default="./mainddpm/configs/cifar10.yml")
@@ -113,6 +119,9 @@ if __name__ == "__main__":
                         help="Enable S-IEC (syndrome-guided correction)")
     # [EXP-C2] IEC-only fresh run 을 위한 S-IEC 비활성 옵션 (실험 5).
     parser.add_argument("--no-use-siec", dest="use_siec", action="store_false")
+    parser.add_argument("--correction-mode", type=str, default="auto",
+                        choices=["auto", "none", "tac", "iec", "siec"],
+                        help="Explicit correction mode. 'auto' keeps legacy use_siec semantics.")
     parser.add_argument("--c_siec", type=float, default=1.0,
                         help="Correction gain multiplier (c in lambda = c*sigma^2/(alpha^2+sigma^2))")
     parser.add_argument("--tau_path", type=str,
@@ -140,8 +149,12 @@ if __name__ == "__main__":
     parser.add_argument("--siec_return_trace", action="store_true", default=False)
     parser.add_argument("--siec_trace_out", type=str,
                         default="./calibration/siec_trace.pt")
-    parser.add_argument("--siec_trace_mode", type=str, default="siec",
-                        choices=["iec", "siec"])
+    parser.add_argument("--siec_trace_mode", type=str, default="auto",
+                        choices=["auto", "none", "tac", "iec", "siec"])
+    parser.add_argument("--trace_include_x0", action="store_true", default=False,
+                        help="Include per-step x0 trajectory in the saved trace (large files).")
+    parser.add_argument("--disable-cache-reuse", action="store_true", default=False,
+                        help="Keep DeepCache calibration/intervals but force slow-path forwards at every step.")
     # ===============================================
 
     args = parser.parse_args()
@@ -176,22 +189,37 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
     logging.info("start!")
     seed_everything(args.seed)
-    # [EXP-C4] no-cache 모드에서는 calibration 로드를 건너뛴다.
-    # interval_seq=None 이면 runner 가 generalized_steps (비-DeepCache fp16 경로) 로 떨어진다.
-    if args.cache:
+    args.correction_mode = normalize_correction_mode(args)
+    if args.siec_collect_scores and args.correction_mode != "siec":
+        raise ValueError("--siec_collect_scores requires correction-mode=siec")
+
+    # Experimental copy keeps DeepCache calibration/intervals available even when
+    # cache reuse is disabled. This is how exp5 pure-quant / fp16 settings reuse
+    # the same schedule/check positions without inheriting cache-reuse error.
+    if args.disable_cache_reuse and not args.cache:
+        raise ValueError("use either --disable-cache-reuse or --no-cache, not both")
+    if args.ptq and not args.cache:
+        raise ValueError("PTQ with --no-cache is unsupported in this experimental copy; use --disable-cache-reuse instead")
+    if args.correction_mode != "none" and not args.cache:
+        raise ValueError("correction-mode with --no-cache is unsupported; keep cache enabled and use --disable-cache-reuse if needed")
+
+    load_calibration = args.cache or args.disable_cache_reuse or args.ptq or args.correction_mode in {"iec", "siec", "tac"}
+    if load_calibration:
         logger.info("load calibration...")
-        interval_seq, all_cali_data, all_t, all_cali_t, all_cache \
-            = torch.load("./calibration/cifar{}_cache{}_{}.pth".format(
-                args.timesteps, args.replicate_interval, args.mode))
+        interval_seq, all_cali_data, all_t, all_cali_t, all_cache = torch.load(
+            "./calibration/cifar{}_cache{}_{}.pth".format(
+                args.timesteps, args.replicate_interval, args.mode
+            )
+        )
         args.interval_seq = interval_seq
         logger.info(f"The interval_seq: {args.interval_seq}")
     else:
-        logger.info("[EXP-C4] --no-cache: DeepCache calibration 로드 생략.")
+        logger.info("[EXP] calibration not required for this run.")
         interval_seq, all_cali_data, all_t, all_cali_t, all_cache = None, [], [], [], []
         args.interval_seq = None
 
     # ============== S-IEC tau schedule ==============
-    if args.use_siec:
+    if args.correction_mode == "siec":
         if args.siec_collect_scores:
             logger.info("[S-IEC] Pilot mode: will collect syndrome scores (no correction).")
             args.tau_schedule = None
@@ -236,6 +264,7 @@ if __name__ == "__main__":
         q_unet = QModel(model, args, wq_params=wq_params, aq_params=aq_params)
         q_unet.cuda()
         q_unet.eval()
+        q_unet._exp_backend = getattr(model, "_exp_backend", "deepcache")
 
         print("Setting the first and the last layer to 8-bit")
         q_unet.set_first_last_layer_to_8bit()
@@ -292,25 +321,46 @@ if __name__ == "__main__":
         runner.sample_fid(model, total_n_samples=args.num_samples)
 
     # ========== Save pilot scores if in pilot mode ==========
-    if args.use_siec and args.siec_collect_scores:
+    if args.correction_mode == "siec" and args.siec_collect_scores:
         if hasattr(args, '_pilot_scores') and len(args._pilot_scores) > 0:
             logger.info(f"[S-IEC] Pilot collected {len(args._pilot_scores)} batches of scores")
-            # Convert to [T][num_batches] format
+            # Preserve both per-sample score distributions (for tau calibration)
+            # and per-batch mean scores (for trigger-rate matching against the
+            # runtime, which currently triggers on batch-mean score > tau).
             T = len(args._pilot_scores[0])
             scores_by_t = [[] for _ in range(T)]
+            batch_score_means_by_t = [[] for _ in range(T)]
             for batch_scores in args._pilot_scores:
-                for t_idx, s in enumerate(batch_scores):
-                    scores_by_t[t_idx].append(float(s))
+                for t_idx, step_scores in enumerate(batch_scores):
+                    if step_scores is None:
+                        continue
+                    if isinstance(step_scores, (list, tuple)):
+                        values = [float(s) for s in step_scores]
+                    else:
+                        values = [float(step_scores)]
+                    if not values:
+                        continue
+                    scores_by_t[t_idx].extend(values)
+                    batch_score_means_by_t[t_idx].append(sum(values) / len(values))
 
             os.makedirs(os.path.dirname(args.siec_scores_out), exist_ok=True)
-            torch.save(scores_by_t, args.siec_scores_out)
+            torch.save(
+                {
+                    "format_version": 2,
+                    "scores_by_t": scores_by_t,
+                    "batch_score_means_by_t": batch_score_means_by_t,
+                    "num_batches": len(args._pilot_scores),
+                    "num_timesteps": T,
+                },
+                args.siec_scores_out,
+            )
             logger.info(f"[S-IEC] Saved pilot scores to {args.siec_scores_out}")
         else:
             logger.warning("[S-IEC] Pilot mode but no scores collected!")
 
     # [EXP-C3] --siec_return_trace 일 때 step 별 트리거 수 / NFE trace 를 저장.
-    if args.use_siec and args.siec_return_trace:
-        traces = getattr(args, "_siec_traces", [])
+    if args.siec_return_trace:
+        traces = getattr(args, "_exp_traces", [])
         if traces:
             os.makedirs(os.path.dirname(args.siec_trace_out), exist_ok=True)
             torch.save(traces, args.siec_trace_out)

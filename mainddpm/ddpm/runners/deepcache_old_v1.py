@@ -255,45 +255,17 @@ class Diffusion(object):
                 xs = generalized_steps(
                     x, seq, model, self.betas, 
                     timesteps=timesteps,
-                    cache_interval=self.args.cache_interval,
-                    non_uniform=self.args.non_uniform, pow=self.args.pow,
-                    center=self.args.center, branch=self.args.branch,
+                    cache_interval=self.args.cache_interval,  # for uniform
+                    non_uniform=self.args.non_uniform, pow = self.args.pow, center = self.args.center, branch=self.args.branch,  # for non-uniform
                     eta=self.args.eta)
             else:
-                # ★ S-IEC branch
-                if getattr(self.args, 'use_siec', False):
-                    from ..functions.deepcache_denoising import adaptive_generalized_steps_siec
-                    result = adaptive_generalized_steps_siec(
-                        x, seq, model, self.betas,
-                        timesteps=timesteps,
-                        interval_seq=self.interval_seq,
-                        branch=self.args.branch,
-                        eta=self.args.eta,
-                        quant=self.args.ptq,
-                        c_siec=getattr(self.args, 'c_siec', 1.0),
-                        tau_schedule=getattr(self.args, 'tau_schedule', None),
-                        siec_always_correct=getattr(self.args, 'siec_always_correct', False),
-                        siec_collect_scores=getattr(self.args, 'siec_collect_scores', False),
-                        siec_max_rounds=getattr(self.args, 'siec_max_rounds', 1),
-                    )
-                    # result is (xs, x0_preds) or (xs, x0_preds, scores)
-                    if getattr(self.args, 'siec_collect_scores', False) and len(result) == 3:
-                        xs_list, x0_preds_list, batch_scores = result
-                        # Accumulate pilot scores on args (for later τ calibration)
-                        if not hasattr(self.args, '_pilot_scores'):
-                            self.args._pilot_scores = []  # list of list[float]
-                        self.args._pilot_scores.append(batch_scores)
-                        xs = (xs_list, x0_preds_list)  # ★ tuple로 통일 (non-pilot과 동일 형태)
-                    else:
-                        xs = result
-                else:
-                    from ..functions.deepcache_denoising import adaptive_generalized_steps_3
-                    xs = adaptive_generalized_steps_3(
-                        x, seq, model, self.betas,
-                        timesteps=timesteps,
-                        interval_seq=self.interval_seq, branch=self.args.branch,
-                        eta=self.args.eta,
-                        quant=self.args.ptq)
+                from ..functions.deepcache_denoising import adaptive_generalized_steps_3
+                xs = adaptive_generalized_steps_3(
+                    x, seq, model, self.betas, 
+                    timesteps=timesteps,
+                    interval_seq = self.interval_seq, branch=self.args.branch,  # for non-uniform
+                    eta=self.args.eta,
+                    quant=self.args.ptq)
             x = xs
         elif self.args.sample_type == "ddpm_noisy":
             # Not implemented for DeepCache
