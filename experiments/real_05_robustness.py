@@ -672,26 +672,65 @@ def plot_two_panel(rows: list[dict], out_png: Path) -> None:
     import matplotlib.pyplot as plt
 
     ready = completed_rows(rows)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.grid": True,
+        "grid.alpha": 0.3,
+        "savefig.dpi": 150,
+    })
 
-    styles = {
-        "no_correction": ("tab:gray", "No correction"),
-        "tac": ("tab:green", "TAC"),
-        "iec": ("tab:orange", "IEC"),
-        "siec": ("tab:blue", "S-IEC"),
+    colors = {
+        "no_correction": "#888888",
+        "tac": "#28A050",
+        "iec": "#005AA0",
+        "siec": "#E07814",
     }
+    markers = {
+        "no_correction": "X",
+        "tac": "D",
+        "iec": "s",
+        "siec": "o",
+    }
+    labels = {
+        "no_correction": "No correction",
+        "tac": "TAC",
+        "iec": "IEC",
+        "siec": "S-IEC",
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    for ax in axes:
+        ax.set_facecolor("white")
+        ax.grid(alpha=0.3)
+
     for method_key in ("no_correction", "tac", "iec", "siec"):
         items = sorted([r for r in ready if r["method_key"] == method_key], key=lambda r: r["error_strength"])
         if not items:
             continue
-        color, label = styles[method_key]
-        axes[0].plot([r["error_strength"] for r in items], [r["fid"] for r in items], "o-", color=color, label=label)
+        axes[0].plot(
+            [r["error_strength"] for r in items],
+            [r["fid"] for r in items],
+            "-",
+            color=colors[method_key],
+            linewidth=2,
+            alpha=0.8,
+        )
+        axes[0].scatter(
+            [r["error_strength"] for r in items],
+            [r["fid"] for r in items],
+            s=65,
+            marker=markers[method_key],
+            color=colors[method_key],
+            edgecolors="k",
+            linewidths=0.5,
+            label=labels[method_key],
+            zorder=4,
+        )
 
     axes[0].set_xlabel("Error strength")
-    axes[0].set_ylabel("FID")
-    axes[0].set_title("Error Strength vs FID")
-    axes[0].grid(alpha=0.3)
-    axes[0].legend()
+    axes[0].set_ylabel("FID (↓ better)")
+    axes[0].set_title("(a) Error Strength vs FID")
+    axes[0].legend(fontsize=8, loc="upper left")
 
     iec_by_setting = {r["setting"]: r for r in ready if r["method_key"] == "iec"}
     tac_by_setting = {r["setting"]: r for r in ready if r["method_key"] == "tac"}
@@ -701,22 +740,23 @@ def plot_two_panel(rows: list[dict], out_png: Path) -> None:
         xs = [x for x, _, _ in iec_pairs]
         ys = [y for _, y, _ in iec_pairs]
         if xs:
-            axes[1].plot(xs, ys, "o-", color="tab:purple", label="FID(IEC) - FID(S-IEC)")
+            axes[1].plot(xs, ys, "-", color=colors["siec"], linewidth=2, alpha=0.8, label="FID(IEC) - FID(S-IEC)")
+            axes[1].scatter(xs, ys, s=65, marker="o", color=colors["siec"], edgecolors="k", linewidths=0.5, zorder=4)
             for x, y, label in iec_pairs:
                 axes[1].annotate(label, (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
         xs_tac = [r["error_strength"] for r in siec_items if r["setting"] in tac_by_setting]
         ys_tac = [tac_by_setting[r["setting"]]["fid"] - r["fid"] for r in siec_items if r["setting"] in tac_by_setting]
         if xs_tac:
-            axes[1].plot(xs_tac, ys_tac, "s--", color="tab:green", label="FID(TAC) - FID(S-IEC)")
+            axes[1].plot(xs_tac, ys_tac, "--", color=colors["tac"], linewidth=1.6, alpha=0.8, label="FID(TAC) - FID(S-IEC)")
+            axes[1].scatter(xs_tac, ys_tac, s=55, marker="D", color=colors["tac"], edgecolors="k", linewidths=0.5, zorder=4)
 
     axes[1].axhline(0, color="black", linewidth=0.5)
     axes[1].set_xlabel("Error strength")
-    axes[1].set_ylabel("Gain")
-    axes[1].set_title("Relative Gain of S-IEC")
-    axes[1].grid(alpha=0.3)
-    axes[1].legend()
+    axes[1].set_ylabel("FID(IEC) - FID(S-IEC)")
+    axes[1].set_title("(b) Relative Gain of S-IEC")
+    axes[1].legend(fontsize=8, loc="best")
 
-    fig.tight_layout()
+    plt.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=150)
     fig.savefig(out_png.with_suffix(".pdf"))

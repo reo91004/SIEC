@@ -611,164 +611,165 @@ def plot_two_panel(rows: list[dict], out_png: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.ticker import FormatStrFormatter
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.grid": True,
+        "grid.alpha": 0.3,
+        "savefig.dpi": 150,
+    })
 
+    colors = {
+        "siec": "#E07814",
+        "uncorr": "#888888",
+        "iec": "#005AA0",
+        "naive": "#6A5ACD",
+        "random": "#D2691E",
+        "uniform": "#2F4F4F",
+        "tac": "#28A050",
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
     ready = completed_rows(rows)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5))
-    fig.patch.set_facecolor("white")
 
     for ax in axes:
-        ax.set_facecolor("#fcfcfc")
-        ax.grid(alpha=0.22, linewidth=0.8)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+        ax.set_facecolor("white")
+        ax.grid(alpha=0.3)
 
-    siec_rows = sorted(
-        [r for r in ready if r["method_key"] == "siec" and r.get("tau_percentile") is not None],
-        key=lambda r: r["tau_percentile"],
-    )
+    siec_rows = [r for r in ready if r["method_key"] == "siec" and r.get("tau_percentile") is not None]
     if siec_rows:
-        xs = [r["per_sample_nfe"] for r in siec_rows]
-        ys = [r["fid"] for r in siec_rows]
+        left_items = sorted(siec_rows, key=lambda r: r["nfe_total"])
+        right_items = sorted(siec_rows, key=lambda r: r["trigger_rate"])
+
         axes[0].plot(
-            xs, ys, "o-", color="#1f77b4", linewidth=2.2, markersize=7,
-            markerfacecolor="white", markeredgewidth=1.8, label="S-IEC tau sweep"
+            [r["nfe_total"] for r in left_items],
+            [r["fid"] for r in left_items],
+            "-",
+            color=colors["siec"],
+            linewidth=2,
+            alpha=0.7,
+            label="S-IEC curve",
         )
         axes[1].plot(
-            [r["trigger_rate"] for r in siec_rows], ys, "o-", color="#1f77b4",
-            linewidth=2.2, markersize=7, markerfacecolor="white",
-            markeredgewidth=1.8, label="S-IEC tau sweep"
+            [r["trigger_rate"] for r in right_items],
+            [r["fid"] for r in right_items],
+            "-",
+            color=colors["siec"],
+            linewidth=2,
+            alpha=0.7,
+            label="S-IEC curve",
         )
+
         for row in siec_rows:
+            tau = int(row["tau_percentile"])
+            axes[0].scatter(
+                row["nfe_total"],
+                row["fid"],
+                s=60,
+                marker="o",
+                color=colors["siec"],
+                edgecolors="k",
+                linewidths=0.5,
+                zorder=5,
+            )
+            axes[1].scatter(
+                row["trigger_rate"],
+                row["fid"],
+                s=60,
+                marker="o",
+                color=colors["siec"],
+                edgecolors="k",
+                linewidths=0.5,
+                zorder=5,
+            )
             axes[0].annotate(
-                f"p{row['tau_percentile']}",
-                (row["per_sample_nfe"], row["fid"]),
-                textcoords="offset points",
-                xytext=(6, 6),
+                f"τ={tau}",
+                (row["nfe_total"], row["fid"]),
                 fontsize=8,
-                color="#1f77b4",
+                textcoords="offset points",
+                xytext=(5, 5),
             )
             axes[1].annotate(
-                f"p{row['tau_percentile']}",
+                f"τ={tau}",
                 (row["trigger_rate"], row["fid"]),
-                textcoords="offset points",
-                xytext=(6, 6),
                 fontsize=8,
-                color="#1f77b4",
+                textcoords="offset points",
+                xytext=(5, 5),
             )
 
     baseline_specs = {
-        "no_correction": ("D", "#7f7f7f", "No correction"),
-        "iec": ("s", "#ff7f0e", "IEC"),
-        "always_on": ("^", "#d62728", "Naive always-on refinement"),
+        "no_correction": ("X", colors["uncorr"], "No correction"),
+        "iec": ("s", colors["iec"], "IEC"),
+        "always_on": ("D", colors["naive"], "Naive refinement (always)"),
+        "random": ("^", colors["random"], "Random trigger"),
+        "uniform": ("p", colors["uniform"], "Uniform periodic"),
+        "tac": ("*", colors["tac"], "TAC"),
     }
-    drawn = set()
-    baseline_lookup = {}
-    for row in ready:
-        spec = baseline_specs.get(row["method_key"])
-        if spec is None:
-            continue
-        marker, color, label = spec
-        legend_label = label if label not in drawn else None
-        drawn.add(label)
-        axes[0].scatter(
-            [row["per_sample_nfe"]], [row["fid"]],
-            marker=marker, s=110, color=color, edgecolors="white",
-            linewidths=0.9, zorder=4, label=legend_label
-        )
-        axes[1].scatter(
-            [row["trigger_rate"]], [row["fid"]],
-            marker=marker, s=110, color=color, edgecolors="white",
-            linewidths=0.9, zorder=4, label=legend_label
-        )
-        baseline_lookup[row["method_key"]] = row
 
-    matched_styles = (
-        ("random", "#2ca02c", "X", "Random trigger"),
-        ("uniform", "#9467bd", "P", "Uniform periodic"),
-    )
-    for method_key, color, marker, label in matched_styles:
+    for method_key in ("no_correction", "iec", "always_on", "random", "uniform", "tac"):
         items = [r for r in ready if r["method_key"] == method_key]
         if not items:
             continue
-        items_by_nfe = sorted(items, key=lambda r: r["per_sample_nfe"])
-        items_by_trigger = sorted(items, key=lambda r: r["trigger_rate"])
-        axes[0].plot(
-            [r["per_sample_nfe"] for r in items_by_nfe],
-            [r["fid"] for r in items_by_nfe],
-            linestyle="--", linewidth=1.4, alpha=0.65, color=color,
-        )
+        marker, color, label = baseline_specs[method_key]
+        items_left = sorted(items, key=lambda r: r["nfe_total"])
+        items_right = sorted(items, key=lambda r: r["trigger_rate"])
+        if len(items_left) > 1:
+            axes[0].plot(
+                [r["nfe_total"] for r in items_left],
+                [r["fid"] for r in items_left],
+                "--",
+                color=color,
+                linewidth=1.2,
+                alpha=0.6,
+            )
+            axes[1].plot(
+                [r["trigger_rate"] for r in items_right],
+                [r["fid"] for r in items_right],
+                "--",
+                color=color,
+                linewidth=1.2,
+                alpha=0.6,
+            )
         axes[0].scatter(
-            [r["per_sample_nfe"] for r in items],
+            [r["nfe_total"] for r in items],
             [r["fid"] for r in items],
-            color=color, marker=marker, s=70, alpha=0.9, label=label
-        )
-        axes[1].plot(
-            [r["trigger_rate"] for r in items_by_trigger],
-            [r["fid"] for r in items_by_trigger],
-            linestyle="--", linewidth=1.4, alpha=0.65, color=color,
+            s=80,
+            marker=marker,
+            color=color,
+            edgecolors="k",
+            linewidths=0.5,
+            label=label,
+            zorder=4,
         )
         axes[1].scatter(
             [r["trigger_rate"] for r in items],
             [r["fid"] for r in items],
-            color=color, marker=marker, s=70, alpha=0.9, label=label
+            s=80,
+            marker=marker,
+            color=color,
+            edgecolors="k",
+            linewidths=0.5,
+            label=label,
+            zorder=4,
         )
 
-    iec_row = baseline_lookup.get("iec")
-    if iec_row is not None:
+    fids = [r["fid"] for r in ready if r.get("fid") is not None]
+    if fids:
+        y_min, y_max = min(fids), max(fids)
+        pad = max(0.15, 0.12 * (y_max - y_min))
         for ax in axes:
-            ax.axhline(iec_row["fid"], color="#ff7f0e", linestyle=":", linewidth=1.3, alpha=0.8)
-        axes[0].axvline(iec_row["per_sample_nfe"], color="#ff7f0e", linestyle=":", linewidth=1.3, alpha=0.8)
-        axes[1].axvline(iec_row["trigger_rate"], color="#ff7f0e", linestyle=":", linewidth=1.3, alpha=0.8)
-        axes[0].annotate(
-            "IEC reference",
-            (iec_row["per_sample_nfe"], iec_row["fid"]),
-            textcoords="offset points",
-            xytext=(8, -14),
-            fontsize=9,
-            color="#b35a00",
-        )
-        axes[1].annotate(
-            "IEC reference",
-            (iec_row["trigger_rate"], iec_row["fid"]),
-            textcoords="offset points",
-            xytext=(8, -14),
-            fontsize=9,
-            color="#b35a00",
-        )
+            ax.set_ylim(y_min - pad, y_max + pad)
 
-    if ready:
-        fids = [r["fid"] for r in ready if r.get("fid") is not None]
-        if fids:
-            y_min, y_max = min(fids), max(fids)
-            pad = max(0.15, 0.12 * (y_max - y_min))
-            for ax in axes:
-                ax.set_ylim(y_min - pad, y_max + pad)
+    axes[0].set_xlabel("Total NFE")
+    axes[0].set_ylabel("FID (↓ better)")
+    axes[0].set_title("(a) NFE vs FID")
+    axes[0].legend(fontsize=8, loc="upper right")
 
-    axes[0].set_xlabel("Per-sample NFE")
-    axes[0].set_ylabel("FID")
-    axes[0].set_title("Compute vs Quality", fontsize=13, weight="bold")
-    axes[0].xaxis.set_major_formatter(FormatStrFormatter("%.0f"))
-
-    axes[1].set_xlabel("Trigger rate")
-    axes[1].set_ylabel("FID")
-    axes[1].set_title("Selectivity vs Quality", fontsize=13, weight="bold")
-    axes[1].xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+    axes[1].set_xlabel("Mean trigger rate")
+    axes[1].set_ylabel("FID (↓ better)")
+    axes[1].set_title("(b) Trigger Rate vs FID")
     axes[1].set_xlim(-0.03, 1.03)
+    axes[1].legend(fontsize=8, loc="upper right")
 
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.02),
-        ncol=3,
-        frameon=False,
-        fontsize=9,
-    )
-
-    fig.suptitle("Experiment 4: Tradeoff Under W8A8 + DeepCache", fontsize=15, weight="bold", y=1.06)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    plt.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=150)
     fig.savefig(out_png.with_suffix(".pdf"))
@@ -795,21 +796,43 @@ def write_compute_matched(rows: list[dict], out_md: Path) -> None:
     if not candidates:
         out_md.write_text("# Compute-Matched Row\n\nS-IEC sweep rows are not completed yet.\n")
         return
-    matched = min(candidates, key=lambda row: abs(row["per_sample_nfe"] - iec["per_sample_nfe"]))
+    matched = min(candidates, key=lambda row: abs(row["nfe_total"] - iec["nfe_total"]))
 
     def fmt(value, places=4):
         return "—" if value is None else f"{value:.{places}f}"
 
+    def best(a, b, lower_is_better=True, places=4):
+        if a is None:
+            return "—", fmt(b, places)
+        if b is None:
+            return fmt(a, places), "—"
+        if (a <= b) == lower_is_better:
+            return f"**{fmt(a, places)}**", fmt(b, places)
+        return fmt(a, places), f"**{fmt(b, places)}**"
+
+    iec_fid, matched_fid = best(iec.get("fid"), matched.get("fid"), lower_is_better=True, places=4)
+    iec_sfid, matched_sfid = best(iec.get("sfid"), matched.get("sfid"), lower_is_better=True, places=4)
+    iec_time, matched_time = best(
+        iec.get("total_wall_clock_sec"),
+        matched.get("total_wall_clock_sec"),
+        lower_is_better=True,
+        places=2,
+    )
+
     lines = [
-        "# Compute-Matched Row (real_04_tradeoff)",
+        "# Table-Style Compute-Matched Comparison",
         "",
-        f"reference_method = `{iec['method_key']}`",
+        f"reference_method = `{iec['method']}`",
+        f"matching_rule = nearest S-IEC point by `total_nfe` at the same `num_samples`",
         f"num_samples = {iec['num_samples']}",
         "",
-        "| Method | FID | sFID | per_sample_NFE | trigger_rate |",
-        "|---|---|---|---|---|",
-        f"| {iec['method']} | {fmt(iec['fid'])} | {fmt(iec['sfid'])} | {fmt(iec['per_sample_nfe'], 2)} | {fmt(iec['trigger_rate'])} |",
-        f"| {matched['method']} | {fmt(matched['fid'])} | {fmt(matched['sfid'])} | {fmt(matched['per_sample_nfe'], 2)} | {fmt(matched['trigger_rate'])} |",
+        "| Method | Total NFE | Per-sample NFE | FID | sFID | Trigger rate | Wall-clock (s) |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+        f"| {iec['method']} | {fmt(iec['nfe_total'], 0)} | {fmt(iec['per_sample_nfe'], 2)} | {iec_fid} | {iec_sfid} | {fmt(iec['trigger_rate'])} | {iec_time} |",
+        f"| {matched['method']} | {fmt(matched['nfe_total'], 0)} | {fmt(matched['per_sample_nfe'], 2)} | {matched_fid} | {matched_sfid} | {fmt(matched['trigger_rate'])} | {matched_time} |",
+        "",
+        f"matched_tau = `{matched.get('tau_percentile')}`",
+        f"delta_total_nfe = {fmt(abs(matched['nfe_total'] - iec['nfe_total']), 0)}",
         "",
     ]
     out_md.parent.mkdir(parents=True, exist_ok=True)
