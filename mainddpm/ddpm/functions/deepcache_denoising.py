@@ -327,10 +327,25 @@ def ddpm_steps(x, seq, model, b, **kwargs):
             xs.append(sample.to('cpu'))
     return xs, x0_preds
 
-def _call_model(model, xt, t, prv_f, branch, quant):
+def _set_model_step(model, step_idx, timesteps, quant):
+    if not quant:
+        return
+    step_idx = max(0, min(int(step_idx), int(timesteps) - 1))
+    if hasattr(model, "set_time"):
+        model.set_time(step_idx)
+    inner = getattr(model, "model", None)
+    if inner is not None and hasattr(inner, "time"):
+        inner.time = step_idx
+    if inner is not None and hasattr(inner, "timesteps"):
+        inner.timesteps = timesteps
+
+
+def _call_model(model, xt, t, prv_f, branch, quant, step_idx=None, timesteps=None):
+    if step_idx is not None and timesteps is not None:
+        _set_model_step(model, step_idx, timesteps, quant)
     et, cur_f = model(xt, t, context=None, prv_f=prv_f, branch=branch)
-    if quant:
-        model.model.time = model.model.time - 1
+    if step_idx is not None and timesteps is not None:
+        _set_model_step(model, step_idx, timesteps, quant)
     return et, cur_f
 
 
@@ -404,8 +419,7 @@ def _adaptive_generalized_core(
             if trace_include_xs:
                 xs_trajectory.append(xt.detach().cpu().clone())
 
-            if quant:
-                model.set_time(len(xs) - 1)
+            _set_model_step(model, cur_i, timesteps, quant)
 
             step_nfe = 0
             refresh_step = cur_i in interval_set
@@ -422,10 +436,10 @@ def _adaptive_generalized_core(
                 lookahead_memo = None
             else:
                 if refresh_step:
-                    et, cur_f = _call_model(model, xt, t, None, branch, quant)
+                    et, cur_f = _call_model(model, xt, t, None, branch, quant, cur_i, timesteps)
                     prv_f = cur_f[0]
                 else:
-                    et, _ = _call_model(model, xt, t, prv_f, branch, quant)
+                    et, _ = _call_model(model, xt, t, prv_f, branch, quant, cur_i, timesteps)
                 step_nfe += 1
                 x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
                 lookahead_memo = None
@@ -449,7 +463,7 @@ def _adaptive_generalized_core(
             elif mode == "iec":
                 checked = refresh_step
                 if checked:
-                    et_new, cur_f_new = _call_model(model, xt_next_hat, t, None, branch, quant)
+                    et_new, cur_f_new = _call_model(model, xt_next_hat, t, None, branch, quant, cur_i, timesteps)
                     prv_f = cur_f_new[0]
                     step_nfe += 1
                     xt_next_new = at_next.sqrt() * ((xt - et_new * (1 - at).sqrt()) / at.sqrt()) + c1 * noise + c2 * et_new
@@ -462,7 +476,9 @@ def _adaptive_generalized_core(
                 if checked:
                     next_refresh = (cur_i + 1) in interval_set
                     look_prv_f = None if (not reuse_lookahead or next_refresh) else prv_f
-                    et_look, _ = _call_model(model, xt_next_tent, next_t, look_prv_f, branch, quant)
+                    et_look, _ = _call_model(
+                        model, xt_next_tent, next_t, look_prv_f, branch, quant, cur_i + 1, timesteps
+                    )
                     step_nfe += 1
                     x0_look = (xt_next_tent - et_look * (1 - at_next).sqrt()) / at_next.sqrt()
                     syndrome, score = compute_syndrome(
@@ -492,7 +508,7 @@ def _adaptive_generalized_core(
                                 xt_next_hat = at_next.sqrt() * x0_corrected + c1 * noise + c2 * et_corrected
                                 if _round < siec_max_rounds - 1:
                                     et_look_new, _ = _call_model(
-                                        model, xt_next_hat, next_t, look_prv_f, branch, quant
+                                        model, xt_next_hat, next_t, look_prv_f, branch, quant, cur_i + 1, timesteps
                                     )
                                     step_nfe += 1
                                     x0_look_new = (
@@ -515,9 +531,6 @@ def _adaptive_generalized_core(
                             }
             else:
                 raise ValueError(f"unknown correction_mode: {correction_mode}")
-
-            if quant:
-                model.model.time = model.model.time + 1
 
             collected_scores.append(batch_score)
             syndrome_per_step.append(batch_score)
@@ -543,7 +556,7 @@ def _adaptive_generalized_core(
     if return_trace:
         return xs, x0_preds, trace
     if siec_collect_scores:
-        return xs, x0_preds, collected_scores
+        return xs, x0_preds, score_values_per_step
     return xs, x0_preds
 
 

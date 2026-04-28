@@ -185,8 +185,7 @@ class Diffusion(object):
         img_id = 0
         logger.info(f"starting from image {img_id}")
         total_n_samples = total_n_samples // self.accelerator.num_processes
-        # n_rounds = (total_n_samples - img_id) // config.sampling.batch_size
-        n_rounds = (total_n_samples - img_id) // self.args.sample_batch
+        n_rounds = int(np.ceil(max(0, total_n_samples - img_id) / self.args.sample_batch))
 
         generate_samples = []
         throughput = []
@@ -195,8 +194,9 @@ class Diffusion(object):
             
             for _ in t:
                 start_time = time.time()
-                # n = config.sampling.batch_size
-                n = self.args.sample_batch
+                n = min(self.args.sample_batch, total_n_samples - img_id)
+                if n <= 0:
+                    break
                 x = torch.randn(
                     n,
                     config.data.channels,

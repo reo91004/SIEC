@@ -308,17 +308,43 @@ if __name__ == "__main__":
     if args.use_siec and args.siec_collect_scores:
         if hasattr(args, '_pilot_scores') and len(args._pilot_scores) > 0:
             logger.info(f"[S-IEC] Pilot collected {len(args._pilot_scores)} batches of scores")
-            # Convert to [T][num_batches] format
+            # Convert to [T][num_batches] batch-mean scores. Runtime S-IEC
+            # triggers on the batch mean, so tau must be calibrated on the
+            # same statistic. Per-sample scores are kept for diagnostics.
             T = len(args._pilot_scores[0])
             scores_by_t = [[] for _ in range(T)]
+            per_sample_scores_by_t = [[] for _ in range(T)]
+            batch_score_means_by_t = [[] for _ in range(T)]
             for batch_scores in args._pilot_scores:
                 for t_idx, s in enumerate(batch_scores):
-                    scores_by_t[t_idx].append(float(s))
+                    if isinstance(s, torch.Tensor):
+                        values = s.detach().cpu().reshape(-1).tolist()
+                    elif isinstance(s, np.ndarray):
+                        values = s.reshape(-1).tolist()
+                    elif isinstance(s, (list, tuple)):
+                        values = list(s)
+                    else:
+                        values = [s]
+                    values = [float(v) for v in values]
+                    if values:
+                        batch_mean = float(np.mean(values))
+                        scores_by_t[t_idx].append(batch_mean)
+                        batch_score_means_by_t[t_idx].append(batch_mean)
+                        per_sample_scores_by_t[t_idx].extend(values)
 
             scores_dir = os.path.dirname(args.siec_scores_out)
             if scores_dir:
                 os.makedirs(scores_dir, exist_ok=True)
-            torch.save(scores_by_t, args.siec_scores_out)
+            torch.save(
+                {
+                    "scores_by_t": scores_by_t,
+                    "batch_score_means_by_t": batch_score_means_by_t,
+                    "per_sample_scores_by_t": per_sample_scores_by_t,
+                    "num_batches": len(args._pilot_scores),
+                    "score_granularity": "batch_mean",
+                },
+                args.siec_scores_out,
+            )
             logger.info(f"[S-IEC] Saved pilot scores to {args.siec_scores_out}")
             
             # Also convert pilot scores to tau schedule

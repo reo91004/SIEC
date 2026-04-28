@@ -39,7 +39,7 @@ run conda run --no-capture-output -n iec \
   python mainddpm/ddim_cifar_siec.py \
   --correction-mode siec \
   --num_samples 512 \
-  --sample_batch 500 \
+  --sample_batch 64 \
   --weight_bit 8 \
   --act_bit 8 \
   --replicate_interval 10 \

@@ -58,6 +58,7 @@ def parse_args():
     p.add_argument("--num-samples", type=int, default=2000)
     p.add_argument("--sample-batch", type=int, default=500)
     p.add_argument("--pilot-samples", type=int, default=512)
+    p.add_argument("--pilot-sample-batch", type=int, default=64)
     p.add_argument("--percentiles", type=int, nargs="+", default=[30, 50, 60, 70, 80, 90, 95])
     p.add_argument("--timesteps", type=int, default=100)
     p.add_argument("--siec-max-rounds", type=int, default=2)
@@ -128,6 +129,29 @@ def tau_path(args, percentile: int) -> Path:
     return IEC_ROOT / f"calibration/tau_schedule{suffix}_p{percentile}.pt"
 
 
+def pilot_scores_are_usable(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        import torch
+        raw_scores = torch.load(path, weights_only=False, map_location="cpu")
+    except Exception:
+        return False
+    if isinstance(raw_scores, dict):
+        scores_by_t = raw_scores.get("scores_by_t")
+        if scores_by_t is None:
+            return False
+        if raw_scores.get("score_granularity") not in (None, "batch_mean"):
+            return False
+    else:
+        scores_by_t = raw_scores
+    try:
+        counts = [len(s) for s in scores_by_t if len(s) > 0]
+    except TypeError:
+        return False
+    return bool(counts) and min(counts) >= 2
+
+
 def png_count(folder: Path) -> int:
     if not folder.exists():
         return 0
@@ -181,12 +205,13 @@ def run_fid(args, sample_npz: Path, log_path: Path) -> tuple[float | None, float
 
 def ensure_tau_schedules(args, cmd_sink: list[list[str]]) -> None:
     pilot_path = pilot_scores_path(args)
-    if not pilot_path.exists():
+    regenerate_pilot = not pilot_scores_are_usable(pilot_path)
+    if regenerate_pilot:
         pilot_cmd = conda_python(args) + [
             entry_script("ddim_cifar_siec.py"),
             "--correction-mode", "siec",
             "--num_samples", str(args.pilot_samples),
-            "--sample_batch", str(args.sample_batch),
+            "--sample_batch", str(min(args.pilot_sample_batch, args.pilot_samples)),
             "--siec_collect_scores",
             "--siec_scores_out", rel(pilot_path),
             "--image_folder", rel(CIFAR_IMAGE_DIR / f"image_tradeoff_pilot_n{args.pilot_samples}"),
@@ -205,7 +230,7 @@ def ensure_tau_schedules(args, cmd_sink: list[list[str]]) -> None:
             run_cmd(pilot_cmd, args.results_dir / "logs" / "pilot_scores.log")
 
     for percentile in args.percentiles:
-        if tau_path(args, percentile).exists():
+        if tau_path(args, percentile).exists() and not regenerate_pilot:
             continue
         cmd = conda_python(args) + [
             entry_script("calibrate_tau_cifar.py"),
