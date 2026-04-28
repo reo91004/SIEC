@@ -11,6 +11,7 @@ experiments/yongseong/results/real_04_tradeoff/*/artifacts
 experiments/yongseong/results/real_05_robustness/*/artifacts
 experiments/yongseong/results/real_04_tradeoff/20*
 experiments/yongseong/results/real_05_robustness/20*
+data/
 
 # datasets & large binaries
 calibration/

@@ -1,6 +1,0 @@
-setting,error_strength,method,tau_percentile,num_samples,fid,sfid,trigger_rate,per_sample_nfe,nfe_total,wall_clock_sec,source_npz,source_log,notes
-fp16,,fp16 reference,,2000,,,0.0,100,200000,,experiments/yongseong/results/real_05_robustness/samples_fp16_fp16_ref_n2000.npz,,fp16 reference (plain DDIM). IEC/S-IEC 는 no quantization regime 에서 no-op 이므로 단일 row 로 보고.
-W8A8_DC10,0.0012604792830316007,No correction (never),,2000,,,,,,,experiments/yongseong/results/real_05_robustness/samples_W8A8_DC10_no_correction_n2000.npz,,runnable
-W8A8_DC10,0.0012604792830316007,S-IEC p80,80,2000,,,0.2,110.0,220000.0,,experiments/yongseong/results/real_05_robustness/samples_W8A8_DC10_siec_n2000.npz,,runnable; n_checks=10
-W8A8_DC10,0.0012604792830316007,IEC (author),,50000,7.2048,,0.0,110,5500000,,iec_samples.npz,logs/stage6_fid_official.log,50K seed; IEC author NFE = 100 + n_checks (10); trigger_rate=0
-W8A8_DC10,0.0012604792830316007,S-IEC (p80 seed 50K),80,50000,8.78727295825496,5.83829983937585,,,,,siec_samples.npz,logs/siec_fid.log,50K seed; S-IEC p80 on W8A8_DC10 (main setting)

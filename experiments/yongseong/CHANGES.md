@@ -222,3 +222,58 @@ P1-P5 dry-run 검증 후 남은 wrapper-level 불명확성을 정리. 실험 복
   - W8A8_DC10 IEC seed FID 는 `logs/stage6_fid_result.txt` 에서 직접 파싱한다.
 - **이유**: robustness table 의 error-strength axis 와 NFE 는 paper-critical 값이라 placeholder/fallback 으로 채우지 않는다.
 - **롤백**: 이 항목 이후 `real_05_robustness.py` 변경분 되돌리기.
+
+### 2026-04-27 KST — EXP-FRAMING (D/E/A) — `deepcache_denoising.py`
+
+- **원본**: `IEC/mainddpm/ddpm/functions/deepcache_denoising.py`
+- **변경 요지**:
+  - **[EXP-FRAMING-D]** `_adaptive_generalized_core()` 에 `reuse_lookahead: bool = False` 옵션 추가.
+    - True 일 때: lookahead `_call_model()` 이 `prv_f=prv_f, allow_cache_reuse=True` 로 cache 재활용.
+    - 추가로 `triggered=False` 인 step 의 lookahead 결과 `(et_look, x0_look, xt_next_hat)` 을 `lookahead_memo` 에 저장하고, 다음 step 진입 시 `t == memo.step_t_int` 이면 첫 forward 를 skip 하고 memo 사용 → toy `siec_sim/core/siec.py:97-99` 의 "net 1 NFE" 의도를 CIFAR 로 이식.
+    - invalidate 조건: triggered=True / 마지막 step / refresh_step / xt mismatch.
+  - **[EXP-FRAMING-E]** `correction_mode="siec_oracle"` 새 모드 + `oracle_xt_ref: list[Tensor] | None`, `oracle_pull_strength: float = 1.0` 옵션. 매 step 끝에서 `xt_next_hat ← (1-pull) xt_next_hat + pull * oracle_xt_ref[cur_i+1]`. syndrome score 는 측정만 (보정에는 미사용).
+    - 신규 entry: `adaptive_generalized_steps_oracle()`.
+  - **[EXP-FRAMING-A]** `trace_include_xs: bool = False` 옵션 + trace dict 에 `xs_trajectory`, `et_per_step` 추가. 실험 A (deploy vs ref) 와 실험 E (reference 확보) 의 입력으로 사용.
+  - `adaptive_generalized_steps_siec()`, `adaptive_generalized_steps_trace()` 시그니처에 위 3 옵션 추가 (모두 default off → 기존 호출 무영향).
+- **이유**: `docs/siec_ecc_framing_20260427.md` §3 의 실험 D/A/E 구현. D 는 NFE +91% 폭증의 원인이 알고리즘이 아니라 lookahead 재활용 차단 (`allow_cache_reuse=False`) 임을 검증. E 는 framing 의 이론 상한 측정. A 는 syndrome–error 상관성 측정.
+- **주석 태그**: `# [EXP-FRAMING-D]`, `# [EXP-FRAMING-E]`, `# [EXP-FRAMING-A]`.
+- **import 영향**: 모든 옵션 default off → 기존 IEC/S-IEC/trace 호출 동일. `experiments/yongseong/deepcache.py` 가 이 옵션을 forwarding.
+- **롤백**: 위 태그가 달린 라인 / 함수 (`adaptive_generalized_steps_oracle`) 제거.
+- **관련 Candidate**: 신규 (FRAMING-D / FRAMING-E / FRAMING-A).
+
+### 2026-04-27 KST — EXP-FRAMING (D/E/A) — `deepcache.py`
+
+- **원본**: `IEC/mainddpm/ddpm/runners/deepcache.py` (실험 복사본)
+- **변경 요지**:
+  - `adaptive_generalized_steps_trace` 호출에 `trace_include_xs`, `reuse_lookahead`, `oracle_xt_ref`, `oracle_pull_strength` forwarding.
+  - `correction_mode="siec_oracle"` 분기 추가: `adaptive_generalized_steps_oracle` 호출 + `args.oracle_xt_ref` 파일 lazy-load (list[Tensor] or dict["xs_trajectory"]).
+  - `correction_mode="siec"` 분기에 `reuse_lookahead` forwarding.
+- **이유**: 새 옵션을 sampling 함수까지 전달.
+- **주석 태그**: `# [EXP-FRAMING-A]`, `# [EXP-FRAMING-D]`, `# [EXP-FRAMING-E]`.
+- **import 영향**: 원본 경로 영향 없음.
+- **롤백**: 해당 태그 라인 / `siec_oracle` 분기 제거.
+- **관련 Candidate**: FRAMING-D / E / A.
+
+### 2026-04-27 KST — EXP-FRAMING (D/E/A) — `ddim_cifar_siec.py`
+
+- **원본**: `IEC/mainddpm/ddim_cifar_siec.py` (실험 복사본)
+- **변경 요지**: CLI 4 개 신규 — `--trace_include_xs`, `--reuse_lookahead`, `--oracle_xt_ref`, `--oracle_pull_strength`, `--correction_mode {auto,none,iec,siec,siec_oracle}`. argparse 에만 추가; 기존 동작 무변경.
+- **이유**: wrapper 들이 새 옵션을 subprocess CLI 로 넘길 수 있도록 노출.
+- **주석 태그**: `# [EXP-FRAMING-A]`, `# [EXP-FRAMING-D]`, `# [EXP-FRAMING-E]`.
+- **import 영향**: 없음.
+- **롤백**: 해당 add_argument 라인 제거.
+- **관련 Candidate**: FRAMING-D / E / A.
+
+### 2026-04-27 KST — EXP-FRAMING (CLI consolidation) — `ddim_cifar_siec.py`
+- **원본**: `IEC/mainddpm/ddim_cifar_siec.py` (실험 복사본)
+- **변경 요지**: 직전 패치에서 추가됐던 두 번째 `--correction_mode` (underscore 형) add_argument 를 제거하고, 기존 `--correction-mode` 의 choices 에 `siec_oracle` 만 합류. argparse 가 두 형태 (hyphen/underscore) 를 같은 dest 에 매핑해 마지막 argv 가 이기는 footgun 회피.
+- **이유**: smoke test 중 dest 충돌로 인해 옵션의 효과가 argv 순서에 의존하는 문제 발견.
+- **롤백**: choices 에서 `siec_oracle` 만 제거.
+- **관련 Candidate**: FRAMING-E (영향 없음 — 외부 노출 인터페이스 동일).
+
+### 2026-04-27 KST — EXP-FRAMING (folder relocation) — wrappers
+- **신규 폴더**: `IEC/experiments/yongseong/framing/`
+- **변경 요지**: framing 실험 6 개 wrapper 를 `IEC/experiments/real_06_framing_*.py` 대신 `IEC/experiments/yongseong/framing/exp_{D,A,B,C,E,F}_*.py` 에 둔다. 사용자가 06–11 번호를 혼동해 폴더 단위로 분리해 달라는 요청을 반영.
+- **공용 helper**: `IEC/experiments/yongseong/framing_common.py` (yongseong/ 직속) — wrapper 들은 한 단계 위 (`Path(__file__).resolve().parent.parent`) 를 sys.path 에 추가해 import.
+- **롤백**: 폴더 삭제.
+- **관련 Candidate**: 모든 FRAMING 실험.

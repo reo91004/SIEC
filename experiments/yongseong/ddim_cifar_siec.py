@@ -119,8 +119,9 @@ if __name__ == "__main__":
                         help="Enable S-IEC (syndrome-guided correction)")
     # [EXP-C2] IEC-only fresh run 을 위한 S-IEC 비활성 옵션 (실험 5).
     parser.add_argument("--no-use-siec", dest="use_siec", action="store_false")
+    # `siec_oracle` added by [EXP-FRAMING-E] for oracle decoder ablation.
     parser.add_argument("--correction-mode", type=str, default="auto",
-                        choices=["auto", "none", "tac", "iec", "siec"],
+                        choices=["auto", "none", "tac", "iec", "siec", "siec_oracle"],
                         help="Explicit correction mode. 'auto' keeps legacy use_siec semantics.")
     parser.add_argument("--c_siec", type=float, default=1.0,
                         help="Correction gain multiplier (c in lambda = c*sigma^2/(alpha^2+sigma^2))")
@@ -155,6 +156,20 @@ if __name__ == "__main__":
                         help="Include per-step x0 trajectory in the saved trace (large files).")
     parser.add_argument("--disable-cache-reuse", action="store_true", default=False,
                         help="Keep DeepCache calibration/intervals but force slow-path forwards at every step.")
+    # [EXP-FRAMING-A] xt trajectory 와 et per step 도 trace 에 포함 (실험 A 의 deploy vs ref 거리 측정용).
+    parser.add_argument("--trace_include_xs", action="store_true", default=False,
+                        help="[EXP-FRAMING-A] Include per-step xt trajectory and et in the saved trace.")
+    # [EXP-FRAMING-D] toy 의 net 1-NFE 의도를 CIFAR 로 옮긴 lookahead 재활용 (cache reuse + memoization).
+    parser.add_argument("--reuse_lookahead", action="store_true", default=False,
+                        help="[EXP-FRAMING-D] Reuse lookahead forward in next step's first forward (toy intent).")
+    # [EXP-FRAMING-E] Oracle decoder: per-step xt 를 fp16 reference 로 직접 pull.
+    parser.add_argument("--oracle_xt_ref", type=str, default=None,
+                        help="[EXP-FRAMING-E] Path to .pt with reference xs_trajectory (list of CPU tensors).")
+    parser.add_argument("--oracle_pull_strength", type=float, default=1.0,
+                        help="[EXP-FRAMING-E] Pull strength (0=no pull, 1=full ref). Used by correction_mode=siec_oracle.")
+    # NOTE: The earlier `--correction-mode` (line ~122) already covers `siec_oracle`
+    # — do not register a second `--correction_mode` flag (argparse would silently let
+    # the last-in-argv one win, which is a footgun).
     # ===============================================
 
     args = parser.parse_args()

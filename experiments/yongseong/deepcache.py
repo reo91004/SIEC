@@ -297,6 +297,30 @@ class Diffusion(object):
                     trace_mode = getattr(self.args, "siec_trace_mode", "auto")
                     if trace_mode == "auto":
                         trace_mode = correction_mode
+                    # [EXP-FRAMING-E] oracle reference xt list (cpu tensor) lazy-load.
+                    oracle_xt_ref = getattr(self.args, "_oracle_xt_ref_loaded", None)
+                    if oracle_xt_ref is None and getattr(self.args, "oracle_xt_ref", None):
+                        import torch as _torch_load
+                        oracle_xt_ref = _torch_load.load(self.args.oracle_xt_ref, map_location="cpu")
+                        # 허용 포맷: list[tensor], dict with key "xs_trajectory",
+                        # or list[dict] (the format `_exp_traces` saves to .pt —
+                        # one dict per batch). For list[dict] we concat each
+                        # step's xt across batches → list of T tensors of
+                        # shape (sum_B, C, H, W).
+                        if isinstance(oracle_xt_ref, dict):
+                            oracle_xt_ref = oracle_xt_ref.get("xs_trajectory", None)
+                        elif isinstance(oracle_xt_ref, list) and oracle_xt_ref and isinstance(oracle_xt_ref[0], dict):
+                            xs_per_batch = [t.get("xs_trajectory") for t in oracle_xt_ref]
+                            xs_per_batch = [x for x in xs_per_batch if x]
+                            if xs_per_batch:
+                                T = len(xs_per_batch[0])
+                                oracle_xt_ref = [
+                                    _torch_load.cat([batch[t] for batch in xs_per_batch], dim=0)
+                                    for t in range(T)
+                                ]
+                            else:
+                                oracle_xt_ref = None
+                        self.args._oracle_xt_ref_loaded = oracle_xt_ref
                     result = adaptive_generalized_steps_trace(
                         x, seq, model, self.betas,
                         mode=trace_mode,
@@ -308,6 +332,11 @@ class Diffusion(object):
                         trigger_prob=getattr(self.args, 'trigger_prob', 0.2),
                         trigger_period=getattr(self.args, 'trigger_period', 5),
                         trace_include_x0=getattr(self.args, "trace_include_x0", False),
+                        # [EXP-FRAMING-A/D/E] forwarding.
+                        trace_include_xs=getattr(self.args, "trace_include_xs", False),
+                        reuse_lookahead=getattr(self.args, "reuse_lookahead", False),
+                        oracle_xt_ref=oracle_xt_ref,
+                        oracle_pull_strength=getattr(self.args, "oracle_pull_strength", 1.0),
                         **common_kwargs,
                     )
                     xs_list, x0_preds_list, trace = result
@@ -337,6 +366,8 @@ class Diffusion(object):
                         trigger_mode=getattr(self.args, 'trigger_mode', 'syndrome'),
                         trigger_prob=getattr(self.args, 'trigger_prob', 0.2),
                         trigger_period=getattr(self.args, 'trigger_period', 5),
+                        # [EXP-FRAMING-D] lookahead 재활용.
+                        reuse_lookahead=getattr(self.args, "reuse_lookahead", False),
                         **common_kwargs,
                     )
                     if getattr(self.args, 'siec_collect_scores', False) and len(result) == 3:
@@ -347,6 +378,27 @@ class Diffusion(object):
                         xs = (xs_list, x0_preds_list)
                     else:
                         xs = result
+                elif correction_mode == "siec_oracle":
+                    # [EXP-FRAMING-E] Oracle decoder 경로.
+                    from deepcache_denoising import adaptive_generalized_steps_oracle
+                    oracle_xt_ref = getattr(self.args, "_oracle_xt_ref_loaded", None)
+                    if oracle_xt_ref is None and getattr(self.args, "oracle_xt_ref", None):
+                        import torch as _torch_load
+                        oracle_xt_ref = _torch_load.load(self.args.oracle_xt_ref, map_location="cpu")
+                        if isinstance(oracle_xt_ref, dict):
+                            oracle_xt_ref = oracle_xt_ref.get("xs_trajectory", None)
+                        self.args._oracle_xt_ref_loaded = oracle_xt_ref
+                    if oracle_xt_ref is None:
+                        raise ValueError(
+                            "[EXP-FRAMING-E] correction_mode=siec_oracle requires --oracle_xt_ref"
+                        )
+                    xs = adaptive_generalized_steps_oracle(
+                        x, seq, model, self.betas,
+                        oracle_xt_ref=oracle_xt_ref,
+                        oracle_pull_strength=getattr(self.args, "oracle_pull_strength", 1.0),
+                        reuse_lookahead=getattr(self.args, "reuse_lookahead", False),
+                        **common_kwargs,
+                    )
                 elif correction_mode == "tac":
                     from deepcache_denoising import adaptive_generalized_steps_tac
                     xs = adaptive_generalized_steps_tac(

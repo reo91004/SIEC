@@ -282,12 +282,27 @@ def _adaptive_generalized_core(
     disable_cache_reuse=False,
     collect_trace=False,
     trace_include_x0=False,
+    # [EXP-FRAMING-D] toy의 net 1-NFE 의도를 CIFAR로 옮긴 lookahead 재활용.
+    # True일 때 (a) lookahead가 cache feature를 reuse하고
+    #          (b) triggered=False step의 lookahead 결과를 다음 step의 first forward로 memoize.
+    reuse_lookahead=False,
+    # [EXP-FRAMING-E] Oracle decoder: per-step xt를 fp16 reference로 직접 pull.
+    # oracle_xt_ref는 길이 (timesteps+1)의 CPU tensor list; correction_mode=="siec_oracle" 때만 활성.
+    oracle_xt_ref=None,
+    oracle_pull_strength=1.0,
+    # [EXP-FRAMING-A] xt trajectory와 et per step을 trace dict에 추가 저장 (실험 A의 deploy vs ref 거리 측정).
+    trace_include_xs=False,
     **kwargs
 ):
     if correction_mode == "tac":
         raise NotImplementedError("TAC correction is not implemented in this repository")
 
-    if correction_mode == "siec":
+    # [EXP-FRAMING-E] siec_oracle 모드는 syndrome 보정 대신 reference로 pull하는 디코더.
+    if correction_mode == "siec_oracle":
+        if oracle_xt_ref is None:
+            raise ValueError("[EXP-FRAMING-E] correction_mode=siec_oracle requires oracle_xt_ref")
+        from siec_core.syndrome import compute_syndrome
+    elif correction_mode == "siec":
         from siec_core.syndrome import compute_syndrome
         from siec_core.correction import compute_gamma, apply_consensus_correction
 
@@ -301,12 +316,20 @@ def _adaptive_generalized_core(
         cur_i = 0
 
         x0_trajectory = []
+        # [EXP-FRAMING-A] xs (xt) trajectory와 et 모두 step별로 저장 (deploy vs ref 거리 측정용).
+        xs_trajectory = []
+        et_per_step = []
         syndrome_per_step = []
         score_values_per_step = []
         triggered_per_step = []
         checked_per_step = []
         nfe_per_step = []
         collected_scores = []
+
+        # [EXP-FRAMING-D] lookahead 결과를 다음 step의 first forward로 재사용하기 위한 memoization 슬롯.
+        # 항목: {"x0_t": tensor, "et": tensor, "xt": tensor, "step_t_int": int}
+        # invalidate 조건은 update 지점에서 명시적으로 처리.
+        lookahead_memo = None
 
         for i, j in zip(reversed(seq), reversed(seq_next)):
             t = (torch.ones(n) * i).to(x.device)
@@ -323,21 +346,41 @@ def _adaptive_generalized_core(
             allow_cache_reuse = (not disable_cache_reuse) and (not refresh_step)
 
             step_nfe = 0
-            et, next_prv_f = _call_model(
-                model,
-                xt,
-                t,
-                branch=branch,
-                prv_f=prv_f,
-                allow_cache_reuse=allow_cache_reuse,
-            )
-            _post_forward_quant_step(model, quant)
-            step_nfe += 1
 
-            x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
+            # [EXP-FRAMING-D] memoized lookahead 재활용.
+            # 이전 step의 lookahead가 정확히 현재 step의 xt에서 찍힌 forward라면
+            # 첫 forward를 skip하고 그 결과를 사용 (toy의 "net 1 NFE" 의도).
+            memo_used = False
+            if reuse_lookahead and lookahead_memo is not None and not refresh_step:
+                memo_t_int = lookahead_memo["step_t_int"]
+                cur_t_int = int(t.long()[0].item())
+                if memo_t_int == cur_t_int and lookahead_memo["xt"].shape == xt.shape:
+                    # state alignment: lookahead가 본 xt가 현재 xt와 같아야 함.
+                    if torch.allclose(lookahead_memo["xt"].to(xt.device), xt, rtol=1e-4, atol=1e-4):
+                        et = lookahead_memo["et"].to(xt.device)
+                        x0_t = lookahead_memo["x0_t"].to(xt.device)
+                        memo_used = True
+                        # next_prv_f는 보존된 prv_f를 그대로 사용 (cache state 갱신 없음).
+                        next_prv_f = prv_f
+            if not memo_used:
+                et, next_prv_f = _call_model(
+                    model,
+                    xt,
+                    t,
+                    branch=branch,
+                    prv_f=prv_f,
+                    allow_cache_reuse=allow_cache_reuse,
+                )
+                _post_forward_quant_step(model, quant)
+                step_nfe += 1
+                x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
+
             x0_preds.append(x0_t.to("cpu"))
             if trace_include_x0:
                 x0_trajectory.append(x0_t.detach().cpu().clone())
+            if trace_include_xs:
+                xs_trajectory.append(xt.detach().cpu().clone())
+                et_per_step.append(et.detach().cpu().clone())
 
             noise = torch.randn_like(x)
             xt_next_hat, c1, c2 = _ddim_transition(
@@ -389,13 +432,17 @@ def _adaptive_generalized_core(
                 # path, but they must not gate whether S-IEC evaluates/corrects.
                 checked = (next_t.long()[0].item() >= 0)
                 if checked:
-                    et_look, _ = _call_model(
+                    # [EXP-FRAMING-D] reuse_lookahead=True면 lookahead도 cache feature를 reuse.
+                    # 단 refresh_step에서는 cache 자체가 갱신돼야 하므로 fresh forward.
+                    look_prv = prv_f if (reuse_lookahead and not refresh_step) else None
+                    look_cache = (reuse_lookahead and not refresh_step)
+                    et_look, look_prv_post = _call_model(
                         model,
                         xt_next_hat,
                         next_t,
                         branch=branch,
-                        prv_f=None,
-                        allow_cache_reuse=False,
+                        prv_f=look_prv,
+                        allow_cache_reuse=look_cache,
                     )
                     _post_forward_quant_step(model, quant)
                     step_nfe += 1
@@ -431,13 +478,15 @@ def _adaptive_generalized_core(
                                 xt_next_hat = at_next.sqrt() * x0_corrected + c1 * noise + c2 * et_corrected
 
                                 if round_idx < max(1, siec_max_rounds) - 1:
+                                    inner_prv = prv_f if (reuse_lookahead and not refresh_step) else None
+                                    inner_cache = (reuse_lookahead and not refresh_step)
                                     et_look_new, _ = _call_model(
                                         model,
                                         xt_next_hat,
                                         next_t,
                                         branch=branch,
-                                        prv_f=None,
-                                        allow_cache_reuse=False,
+                                        prv_f=inner_prv,
+                                        allow_cache_reuse=inner_cache,
                                     )
                                     _post_forward_quant_step(model, quant)
                                     step_nfe += 1
@@ -450,6 +499,55 @@ def _adaptive_generalized_core(
                                         tau_t = float(tau_schedule[cur_i]) if cur_i < len(tau_schedule) else 0.0
                                         if new_score_val <= tau_t:
                                             break
+
+                    # [EXP-FRAMING-D] triggered=False일 때, 다음 step의 first forward로 재활용할
+                    # (et_look, x0_look) memo. 다음 step의 t는 현재의 next_t (즉 lookahead가
+                    # 본 timestep)와 같아야 한다 (DDIM에서 step i의 next_t == step i+1의 t).
+                    if reuse_lookahead and (not triggered) and not siec_collect_scores:
+                        next_t_int = int(next_t.long()[0].item())
+                        if next_t_int >= 0:
+                            lookahead_memo = {
+                                "step_t_int": next_t_int,
+                                "et": et_look.detach().clone(),
+                                "x0_t": x0_look.detach().clone(),
+                                "xt": xt_next_hat.detach().clone(),
+                            }
+                        else:
+                            lookahead_memo = None
+                    else:
+                        lookahead_memo = None
+                else:
+                    lookahead_memo = None
+
+            # [EXP-FRAMING-E] Oracle decoder: per-step xt를 reference로 직접 pull.
+            if correction_mode == "siec_oracle":
+                checked = (next_t.long()[0].item() >= 0)
+                # syndrome score는 측정만 (보정에는 미사용).
+                if checked:
+                    look_prv = prv_f if (reuse_lookahead and not refresh_step) else None
+                    look_cache = (reuse_lookahead and not refresh_step)
+                    et_look, _ = _call_model(
+                        model,
+                        xt_next_hat,
+                        next_t,
+                        branch=branch,
+                        prv_f=look_prv,
+                        allow_cache_reuse=look_cache,
+                    )
+                    _post_forward_quant_step(model, quant)
+                    step_nfe += 1
+                    x0_look = (xt_next_hat - et_look * (1 - at_next).sqrt()) / at_next.sqrt()
+                    syndrome, score = compute_syndrome(x0_t, x0_look)
+                    batch_score = float(score.mean().item())
+                    score_values = [float(v) for v in score.detach().cpu().reshape(-1).tolist()]
+                # ref index: oracle_xt_ref는 길이 (timesteps+1) 의 list (xs와 정렬), index = cur_i+1.
+                ref_idx = cur_i + 1
+                if 0 <= ref_idx < len(oracle_xt_ref):
+                    ref_xt = oracle_xt_ref[ref_idx].to(xt.device)
+                    if ref_xt.shape == xt_next_hat.shape:
+                        pull = float(oracle_pull_strength)
+                        xt_next_hat = (1.0 - pull) * xt_next_hat + pull * ref_xt
+                        triggered = True
 
             syndrome_per_step.append(batch_score)
             score_values_per_step.append(score_values)
@@ -471,6 +569,9 @@ def _adaptive_generalized_core(
         "batch_size": n,
         "correction_mode": correction_mode,
         "x0_trajectory": x0_trajectory,
+        # [EXP-FRAMING-A] xs_trajectory와 et_per_step (trace_include_xs=True일 때만 채워짐).
+        "xs_trajectory": xs_trajectory,
+        "et_per_step": et_per_step,
         "syndrome_per_step": syndrome_per_step,
         "score_values_per_step": score_values_per_step,
         "triggered_per_step": triggered_per_step,
@@ -561,6 +662,7 @@ def adaptive_generalized_steps_siec(
     trigger_mode="syndrome",
     trigger_prob=0.2,
     trigger_period=5,
+    reuse_lookahead=False,  # [EXP-FRAMING-D]
     **kwargs
 ):
     return _adaptive_generalized_core(
@@ -581,6 +683,33 @@ def adaptive_generalized_steps_siec(
         trigger_mode=trigger_mode,
         trigger_prob=trigger_prob,
         trigger_period=trigger_period,
+        reuse_lookahead=reuse_lookahead,  # [EXP-FRAMING-D]
+        **kwargs,
+    )
+
+
+# [EXP-FRAMING-E] Oracle decoder: ground-truth fp16 xt로 직접 pull. 이론 상한 측정용.
+def adaptive_generalized_steps_oracle(
+    x, seq, model, b, timesteps,
+    interval_seq=None, branch=None, quant=False,
+    oracle_xt_ref=None,
+    oracle_pull_strength=1.0,
+    reuse_lookahead=False,
+    **kwargs
+):
+    return _adaptive_generalized_core(
+        x,
+        seq,
+        model,
+        b,
+        timesteps,
+        interval_seq=interval_seq,
+        branch=branch,
+        quant=quant,
+        correction_mode="siec_oracle",
+        oracle_xt_ref=oracle_xt_ref,
+        oracle_pull_strength=oracle_pull_strength,
+        reuse_lookahead=reuse_lookahead,
         **kwargs,
     )
 
@@ -614,6 +743,10 @@ def adaptive_generalized_steps_trace(
     trigger_prob=0.2,
     trigger_period=5,
     trace_include_x0=False,
+    trace_include_xs=False,           # [EXP-FRAMING-A]
+    reuse_lookahead=False,            # [EXP-FRAMING-D]
+    oracle_xt_ref=None,               # [EXP-FRAMING-E]
+    oracle_pull_strength=1.0,         # [EXP-FRAMING-E]
     **kwargs
 ):
     return _adaptive_generalized_core(
@@ -636,5 +769,9 @@ def adaptive_generalized_steps_trace(
         trigger_period=trigger_period,
         collect_trace=True,
         trace_include_x0=trace_include_x0,
+        trace_include_xs=trace_include_xs,         # [EXP-FRAMING-A]
+        reuse_lookahead=reuse_lookahead,           # [EXP-FRAMING-D]
+        oracle_xt_ref=oracle_xt_ref,               # [EXP-FRAMING-E]
+        oracle_pull_strength=oracle_pull_strength, # [EXP-FRAMING-E]
         **kwargs,
     )
