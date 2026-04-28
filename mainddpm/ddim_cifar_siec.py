@@ -74,7 +74,7 @@ if __name__ == "__main__":
     parser.add_argument("--sequence", action="store_true")
     parser.add_argument("--select_step", type=int, default=None)
     parser.add_argument("--select_depth", type=int, default=None)
-    parser.add_argument("--cache", action="store_true", default=True)
+    parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--replicate_interval", type=int, default=10)
     parser.add_argument("--non_uniform", action="store_true", default=False)
     parser.add_argument("--pow", type=float, default=None)
@@ -92,7 +92,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr_a", type=float, default=1e-4)
     parser.add_argument("--lr_z", type=float, default=1e-4)
     parser.add_argument("--split", action="store_true", default=True)
-    parser.add_argument("--ptq", action="store_true", default=True)
+    parser.add_argument("--ptq", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dps_steps", action="store_true", default=False)
     parser.add_argument("--recon", action="store_true", default=False)
 
@@ -115,6 +115,39 @@ if __name__ == "__main__":
                         help="Where to save collected scores in pilot mode")
     parser.add_argument("--siec_max_rounds", type=int, default=1,
                     help="Number of inner correction rounds (toy SIEC.max_rounds)")
+    parser.add_argument("--correction-mode", dest="correction_mode",
+                        choices=["auto", "none", "iec", "siec", "tac"],
+                        default="auto",
+                        help="Correction backend used by experiment wrappers")
+    parser.add_argument("--siec_return_trace", action="store_true", default=False,
+                        help="Save per-batch S-IEC/IEC trace diagnostics")
+    parser.add_argument("--siec_trace_mode",
+                        choices=["none", "iec", "siec", "tac"],
+                        default=None,
+                        help="Trace backend. Defaults to --correction-mode.")
+    parser.add_argument("--siec_trace_out", type=str,
+                        default="./calibration/siec_trace.pt",
+                        help="Where to save trace diagnostics")
+    parser.add_argument("--trigger_mode",
+                        choices=["syndrome", "random", "uniform"],
+                        default="syndrome",
+                        help="S-IEC trigger source")
+    parser.add_argument("--trigger_prob", type=float, default=0.0,
+                        help="Random trigger probability")
+    parser.add_argument("--trigger_period", type=int, default=1,
+                        help="Uniform trigger period in reverse-step index")
+    parser.add_argument("--siec_score_mode",
+                        choices=["raw", "mean", "calibrated"],
+                        default="raw",
+                        help="Reliability score used by S-IEC")
+    parser.add_argument("--siec_stats_path", type=str, default=None,
+                        help="Clean/full-compute trajectory stats for calibrated S-IEC")
+    parser.add_argument("--reuse_lookahead", action="store_true", default=False,
+                        help="Speculatively reuse non-triggered lookahead output")
+    parser.add_argument("--disable-cache-reuse", action="store_true", default=False,
+                        help="Force full-compute path at every step while keeping trace-capable sampler")
+    parser.add_argument("--trace_include_xs", action="store_true", default=False,
+                        help="Store x_t trajectory in trace diagnostics")
     # ===============================================
 
     args = parser.parse_args()
@@ -155,9 +188,18 @@ if __name__ == "__main__":
             args.timesteps, args.replicate_interval, args.mode))
     args.interval_seq = interval_seq
     logger.info(f"The interval_seq: {args.interval_seq}")
+    if args.disable_cache_reuse:
+        args.interval_seq = list(range(args.timesteps))
+        logger.info("[S-IEC] cache reuse disabled: using full-compute path at every step")
+
+    if args.siec_trace_mode is None:
+        args.siec_trace_mode = args.correction_mode if args.correction_mode != "auto" else (
+            "siec" if args.use_siec else "iec"
+        )
 
     # ============== S-IEC tau schedule ==============
-    if args.use_siec:
+    uses_siec = args.correction_mode == "siec" or (args.correction_mode == "auto" and args.use_siec)
+    if uses_siec:
         if args.siec_collect_scores:
             logger.info("[S-IEC] Pilot mode: will collect syndrome scores (no correction).")
             args.tau_schedule = None
@@ -180,6 +222,14 @@ if __name__ == "__main__":
     else:
         args.tau_schedule = None
     # =================================================
+
+    args.siec_stats = None
+    if args.siec_score_mode != "raw":
+        if not args.siec_stats_path:
+            raise ValueError("--siec_stats_path is required when --siec_score_mode is not raw")
+        from siec_core.syndrome import load_syndrome_stats
+        args.siec_stats = load_syndrome_stats(args.siec_stats_path)
+        logger.info(f"[S-IEC] Loaded syndrome stats from {args.siec_stats_path}")
 
     from ddpm.runners.deepcache import Diffusion
     runner = Diffusion(args, config, interval_seq=args.interval_seq)
@@ -265,7 +315,9 @@ if __name__ == "__main__":
                 for t_idx, s in enumerate(batch_scores):
                     scores_by_t[t_idx].append(float(s))
 
-            os.makedirs(os.path.dirname(args.siec_scores_out), exist_ok=True)
+            scores_dir = os.path.dirname(args.siec_scores_out)
+            if scores_dir:
+                os.makedirs(scores_dir, exist_ok=True)
             torch.save(scores_by_t, args.siec_scores_out)
             logger.info(f"[S-IEC] Saved pilot scores to {args.siec_scores_out}")
             
@@ -276,7 +328,9 @@ if __name__ == "__main__":
                     tau[t_idx] = np.percentile(scores_by_t[t_idx], args.tau_percentile)
 
             tau_out = args.tau_path
-            os.makedirs(os.path.dirname(tau_out), exist_ok=True)
+            tau_dir = os.path.dirname(tau_out)
+            if tau_dir:
+                os.makedirs(tau_dir, exist_ok=True)
             torch.save(torch.from_numpy(tau).float(), tau_out)
 
             logger.info(
@@ -287,5 +341,13 @@ if __name__ == "__main__":
         else:
             logger.warning("[S-IEC] Pilot mode but no scores collected!")
     # ===========================================================
+
+    if args.siec_return_trace:
+        traces = getattr(args, "_siec_traces", [])
+        trace_dir = os.path.dirname(args.siec_trace_out)
+        if trace_dir:
+            os.makedirs(trace_dir, exist_ok=True)
+        torch.save(traces, args.siec_trace_out)
+        logger.info(f"[S-IEC] Saved {len(traces)} trace batches to {args.siec_trace_out}")
 
     logging.info("sample siec finish!")

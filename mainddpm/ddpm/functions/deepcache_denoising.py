@@ -327,10 +327,229 @@ def ddpm_steps(x, seq, model, b, **kwargs):
             xs.append(sample.to('cpu'))
     return xs, x0_preds
 
+def _call_model(model, xt, t, prv_f, branch, quant):
+    et, cur_f = model(xt, t, context=None, prv_f=prv_f, branch=branch)
+    if quant:
+        model.model.time = model.model.time - 1
+    return et, cur_f
+
+
+def _tau_value(tau_schedule, step_idx):
+    if tau_schedule is None:
+        return None
+    return float(tau_schedule[step_idx]) if step_idx < len(tau_schedule) else 0.0
+
+
+def _trigger_decision(mode, score_value, tau_t, step_idx, prob, period):
+    mode = (mode or "syndrome").lower()
+    if mode == "syndrome":
+        return tau_t is not None and score_value > tau_t
+    if mode == "random":
+        return bool(torch.rand((), device="cpu").item() < float(prob or 0.0))
+    if mode == "uniform":
+        p = max(1, int(period or 1))
+        return step_idx % p == 0
+    raise ValueError(f"unknown trigger_mode: {mode}")
+
+
+def _adaptive_generalized_core(
+    x, seq, model, b, timesteps,
+    interval_seq=None, branch=None, quant=False,
+    correction_mode="siec",
+    c_siec=1.0,
+    tau_schedule=None,
+    siec_always_correct=False,
+    siec_collect_scores=False,
+    siec_max_rounds=1,
+    trigger_mode="syndrome",
+    trigger_prob=0.0,
+    trigger_period=1,
+    syndrome_score_mode="raw",
+    syndrome_stats=None,
+    reuse_lookahead=False,
+    return_trace=False,
+    trace_include_xs=False,
+    **kwargs
+):
+    from siec_core.syndrome import compute_syndrome
+    from siec_core.correction import compute_gamma, apply_consensus_correction
+
+    mode = (correction_mode or "siec").lower()
+    interval_set = set(interval_seq or [])
+    model.timesteps = timesteps
+
+    with torch.no_grad():
+        n = x.size(0)
+        seq_next = [-1] + list(seq[:-1])
+        x0_preds = []
+        xs = [x]
+        prv_f = None
+        lookahead_memo = None
+
+        collected_scores = []
+        x0_trajectory = []
+        xs_trajectory = []
+        syndrome_per_step = []
+        score_values_per_step = []
+        checked_per_step = []
+        triggered_per_step = []
+        nfe_per_step = []
+
+        for cur_i, (i, j) in enumerate(zip(reversed(seq), reversed(seq_next))):
+            t = (torch.ones(n) * i).to(x.device)
+            next_t = (torch.ones(n) * j).to(x.device)
+            at = compute_alpha(b, t.long())
+            at_next = compute_alpha(b, next_t.long())
+            xt = xs[-1].to(x.device)
+            if trace_include_xs:
+                xs_trajectory.append(xt.detach().cpu().clone())
+
+            if quant:
+                model.set_time(len(xs) - 1)
+
+            step_nfe = 0
+            refresh_step = cur_i in interval_set
+            memo_hit = (
+                reuse_lookahead
+                and lookahead_memo is not None
+                and int(t[0].item()) == lookahead_memo["t_int"]
+                and not refresh_step
+            )
+
+            if memo_hit:
+                et = lookahead_memo["et"].to(x.device)
+                x0_t = lookahead_memo["x0"].to(x.device)
+                lookahead_memo = None
+            else:
+                if refresh_step:
+                    et, cur_f = _call_model(model, xt, t, None, branch, quant)
+                    prv_f = cur_f[0]
+                else:
+                    et, _ = _call_model(model, xt, t, prv_f, branch, quant)
+                step_nfe += 1
+                x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
+                lookahead_memo = None
+
+            x0_preds.append(x0_t.to("cpu"))
+            x0_trajectory.append(x0_t.detach().cpu().clone())
+
+            c1 = kwargs.get("eta", 0) * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
+            c2 = ((1 - at_next) - c1 ** 2).sqrt()
+            noise = torch.randn_like(x)
+            xt_next_tent = at_next.sqrt() * x0_t + c1 * noise + c2 * et
+            xt_next_hat = xt_next_tent
+
+            checked = False
+            triggered = False
+            batch_score = 0.0
+            score_values = []
+
+            if mode in {"none", "tac"}:
+                pass
+            elif mode == "iec":
+                checked = refresh_step
+                if checked:
+                    et_new, cur_f_new = _call_model(model, xt_next_hat, t, None, branch, quant)
+                    prv_f = cur_f_new[0]
+                    step_nfe += 1
+                    xt_next_new = at_next.sqrt() * ((xt - et_new * (1 - at).sqrt()) / at.sqrt()) + c1 * noise + c2 * et_new
+                    residual = torch.norm(xt_next_new - xt_next_hat) / (torch.norm(xt_next_hat) + 1e-6)
+                    if residual >= 1e-3:
+                        xt_next_hat = xt_next_hat + 0.5 * (xt_next_new - xt_next_hat)
+                    triggered = True
+            elif mode == "siec":
+                checked = next_t.long()[0].item() >= 0
+                if checked:
+                    next_refresh = (cur_i + 1) in interval_set
+                    look_prv_f = None if (not reuse_lookahead or next_refresh) else prv_f
+                    et_look, _ = _call_model(model, xt_next_tent, next_t, look_prv_f, branch, quant)
+                    step_nfe += 1
+                    x0_look = (xt_next_tent - et_look * (1 - at_next).sqrt()) / at_next.sqrt()
+                    syndrome, score = compute_syndrome(
+                        x0_t,
+                        x0_look,
+                        score_mode=syndrome_score_mode,
+                        stats=syndrome_stats,
+                        step_idx=cur_i,
+                    )
+                    batch_score = float(score.mean().item())
+                    score_values = [float(v) for v in score.detach().cpu().reshape(-1)]
+
+                    if not siec_collect_scores:
+                        tau_t = _tau_value(tau_schedule, cur_i)
+                        triggered = (
+                            True if siec_always_correct else
+                            _trigger_decision(trigger_mode, batch_score, tau_t, cur_i, trigger_prob, trigger_period)
+                        )
+
+                        if triggered:
+                            alpha_t_sq = float(at.reshape(-1)[0].item())
+                            sigma_t_sq = 1.0 - alpha_t_sq
+                            gamma = compute_gamma(alpha_t_sq, sigma_t_sq, c=c_siec)
+                            for _round in range(siec_max_rounds):
+                                x0_corrected = apply_consensus_correction(x0_t, syndrome, gamma)
+                                et_corrected = (xt - at.sqrt() * x0_corrected) / (1 - at).sqrt()
+                                xt_next_hat = at_next.sqrt() * x0_corrected + c1 * noise + c2 * et_corrected
+                                if _round < siec_max_rounds - 1:
+                                    et_look_new, _ = _call_model(
+                                        model, xt_next_hat, next_t, look_prv_f, branch, quant
+                                    )
+                                    step_nfe += 1
+                                    x0_look_new = (
+                                        xt_next_hat - et_look_new * (1 - at_next).sqrt()
+                                    ) / at_next.sqrt()
+                                    syndrome, new_score = compute_syndrome(
+                                        x0_t,
+                                        x0_look_new,
+                                        score_mode=syndrome_score_mode,
+                                        stats=syndrome_stats,
+                                        step_idx=cur_i,
+                                    )
+                                    if tau_t is not None and float(new_score.mean().item()) <= tau_t:
+                                        break
+                        elif reuse_lookahead and not next_refresh:
+                            lookahead_memo = {
+                                "t_int": int(next_t[0].item()),
+                                "et": et_look.detach(),
+                                "x0": x0_look.detach(),
+                            }
+            else:
+                raise ValueError(f"unknown correction_mode: {correction_mode}")
+
+            if quant:
+                model.model.time = model.model.time + 1
+
+            collected_scores.append(batch_score)
+            syndrome_per_step.append(batch_score)
+            score_values_per_step.append(score_values)
+            checked_per_step.append(bool(checked))
+            triggered_per_step.append(bool(triggered))
+            nfe_per_step.append(int(step_nfe))
+
+            xs.append(xt_next_hat.to("cpu"))
+
+    trace = {
+        "batch_size": int(n),
+        "correction_mode": mode,
+        "syndrome_score_mode": syndrome_score_mode,
+        "x0_trajectory": x0_trajectory,
+        "xs_trajectory": xs_trajectory,
+        "syndrome_per_step": syndrome_per_step,
+        "score_values_per_step": score_values_per_step,
+        "checked_per_step": checked_per_step,
+        "triggered_per_step": triggered_per_step,
+        "nfe_per_step": nfe_per_step,
+    }
+    if return_trace:
+        return xs, x0_preds, trace
+    if siec_collect_scores:
+        return xs, x0_preds, collected_scores
+    return xs, x0_preds
+
+
 def adaptive_generalized_steps_siec(
     x, seq, model, b, timesteps,
     interval_seq=None, branch=None, quant=False,
-    # S-IEC specific
     c_siec=1.0,
     tau_schedule=None,
     siec_always_correct=False,
@@ -338,351 +557,39 @@ def adaptive_generalized_steps_siec(
     siec_max_rounds=1,
     **kwargs
 ):
-    """
-    S-IEC: Syndrome-guided test-time Error Correction.
-    
-    Follows Prof's toy SIEC.correct_step structure as closely as possible,
-    adapted for IEC's DeepCache + CacheQuant pipeline.
-    
-    Design choice: syndrome check is performed at every reverse timestep,
-    matching Algorithm 1 of the paper. DeepCache interval_seq is used only
-    for the model/cache forward path, not for deciding whether to check/correct.
-    
-    Correction loop mirrors toy SIEC.correct_step:
-      for _ in range(max_rounds):
-          x0_corrected = consensus_correction(...)
-          xt_corrected = ddim_step(xt, x0_corrected, ...)
-          x0_look_new = re_evaluate_lookahead(xt_corrected, t-1)
-          if new_score <= tau: break
-          x0_look = x0_look_new
-    """
-    
-    from siec_core.syndrome import compute_syndrome
-    from siec_core.correction import compute_gamma, apply_consensus_correction
-
-    model.timesteps = timesteps
-    with torch.no_grad():
-        n = x.size(0)
-        seq_next = [-1] + list(seq[:-1])
-        x0_preds = []
-        xs = [x]
-        prv_f = None
-        cur_i = 0
-
-        # Diagnostics (for analysis / pilot)
-        collected_scores = []   # score at each step (batch mean)
-        triggered_flags = []    # whether correction triggered
-        nfe_per_step = []       # NFE count per step
-
-        for i, j in zip(reversed(seq), reversed(seq_next)):
-            t = (torch.ones(n) * i).to(x.device)
-            next_t = (torch.ones(n) * j).to(x.device)
-            at = compute_alpha(b, t.long())
-            at_next = compute_alpha(b, next_t.long())
-            xt = xs[-1].to('cuda')
-
-            time = len(xs) - 1
-            if quant:
-                model.set_time(time)
-
-            step_nfe = 0
-
-            # ============================================
-            # Step 1: Forward at t
-            # ============================================
-            if cur_i in interval_seq:
-                et, cur_f = model(xt, t, context=None, prv_f=None, branch=branch)
-                prv_f = cur_f[0]
-            else:
-                et, cur_f = model(xt, t, context=None, prv_f=prv_f, branch=branch)
-            if quant:
-                model.model.time = model.model.time - 1
-            step_nfe += 1
-
-            # x̂_0 at t
-            x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
-            x0_preds.append(x0_t.to('cpu'))
-
-            # Standard DDIM coefficients
-            c1 = kwargs.get("eta", 0) * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
-            c2 = ((1 - at_next) - c1 ** 2).sqrt()
-            # Save the noise used for c1 term (same noise reused in corrections)
-            noise = torch.randn_like(x)
-
-            # ============================================
-            # Step 2: Tentative transition
-            # ============================================
-            xt_next_tent = at_next.sqrt() * x0_t + c1 * noise + c2 * et
-            xt_next_hat = xt_next_tent
-
-            # ============================================
-            # Step 3~5: S-IEC syndrome check at every timestep
-            # ============================================
-            # Algorithm 1 checks the tentative transition at every reverse step.
-            # interval_seq still controls DeepCache refresh vs reuse above,
-            # but it no longer gates syndrome checking/correction.
-            do_siec_check = (next_t.long()[0].item() >= 0)
-            batch_score_value = 0.0
-            triggered = False
-
-            if do_siec_check:
-                # Lookahead forward at t-1 on tentative xt_next
-                et_look, _ = model(xt_next_tent, next_t, context=None, prv_f=None, branch=branch)
-                if quant:
-                    model.model.time = model.model.time - 1
-                step_nfe += 1
-
-                x0_look = (xt_next_tent - et_look * (1 - at_next).sqrt()) / at_next.sqrt()
-
-                # Syndrome: ŝ = x̂_0(t) - x̂_0(t-1)
-                syndrome, score = compute_syndrome(x0_t, x0_look)
-                batch_score_value = float(score.mean().item())
-
-                if siec_collect_scores:
-                    # Pilot mode: just record, don't correct
-                    pass
-                else:
-                    # Threshold decision
-                    if siec_always_correct:
-                        triggered = True
-                    elif tau_schedule is not None:
-                        tau_t = float(tau_schedule[cur_i]) if cur_i < len(tau_schedule) else 0.0
-                        triggered = (batch_score_value > tau_t)
-
-                    if triggered:
-                        # ============================================
-                        # Step 5: Correction loop (matches toy correct_step)
-                        # ============================================
-                        alpha_t_sq = float(at.reshape(-1)[0].item())
-                        sigma_t_sq = 1.0 - alpha_t_sq
-                        gamma = compute_gamma(alpha_t_sq, sigma_t_sq, c=c_siec)
-                        
-                        for _round in range(siec_max_rounds):
-                            x0_corrected = apply_consensus_correction(x0_t, syndrome, gamma)
-                            # ★ 핵심 수정: ε를 x0_corrected와 일관되게 재유도
-                            et_corrected = (xt - at.sqrt() * x0_corrected) / (1 - at).sqrt()
-                            xt_next_hat = at_next.sqrt() * x0_corrected + c1 * noise + c2 * et_corrected
-
-                            # For max_rounds > 1: re-evaluate lookahead
-                            if _round < siec_max_rounds - 1:
-                                et_look_new, _ = model(
-                                    xt_next_hat, next_t, context=None,
-                                    prv_f=None, branch=branch
-                                )
-                                if quant:
-                                    model.model.time = model.model.time - 1
-                                step_nfe += 1
-
-                                x0_look_new = (
-                                    xt_next_hat - et_look_new * (1 - at_next).sqrt()
-                                ) / at_next.sqrt()
-                                syndrome, new_score = compute_syndrome(
-                                    x0_t, x0_look_new
-                                )
-                                new_score_val = float(new_score.mean().item())
-
-                                # Early termination check
-                                if tau_schedule is not None:
-                                    tau_t = float(tau_schedule[cur_i]) if cur_i < len(tau_schedule) else 0.0
-                                    if new_score_val <= tau_t:
-                                        break
-
-            collected_scores.append(batch_score_value)
-            triggered_flags.append(triggered)
-            nfe_per_step.append(step_nfe)
-
-            xs.append(xt_next_hat.to('cpu'))
-            cur_i += 1
-
-    # Return diagnostics (attached via special flag or structure)
-    if siec_collect_scores:
-        return xs, x0_preds, collected_scores
-    
-    # For non-pilot: return standard tuple
-    # Trigger/NFE info stored on xs as attribute (optional, for debugging)
-    return xs, x0_preds
+    """S-IEC sampling path. The public name stays S-IEC."""
+    return _adaptive_generalized_core(
+        x, seq, model, b, timesteps,
+        interval_seq=interval_seq, branch=branch, quant=quant,
+        correction_mode="siec",
+        c_siec=c_siec,
+        tau_schedule=tau_schedule,
+        siec_always_correct=siec_always_correct,
+        siec_collect_scores=siec_collect_scores,
+        siec_max_rounds=siec_max_rounds,
+        **kwargs,
+    )
 
 
 def adaptive_generalized_steps_trace(
     x, seq, model, b, timesteps,
     interval_seq=None, branch=None, quant=False,
-    mode='iec',   # 'iec' or 'siec'
-    # S-IEC options (mode='siec'일 때만)
+    mode="iec",
     c_siec=1.0,
     tau_schedule=None,
     siec_always_correct=False,
     siec_max_rounds=1,
     **kwargs
 ):
-    """
-    Path error / martingale deviation 측정 전용 sampling.
-    
-    IEC와 S-IEC의 x0 trajectory를 기록해서 비교할 수 있게 함.
-    
-    Returns:
-        xs, x0_preds: 기존과 동일 (sample_image가 쓸 수 있도록)
-        trace: dict with diagnostic arrays
-            - x0_trajectory: list of (B, C, H, W) per reverse step
-            - syndrome_per_step: list of float (batch mean r_t)
-            - triggered_per_step: list of bool (correction 여부)
-            - nfe_per_step: list of int
-    """
-    
-    from siec_core.syndrome import compute_syndrome
-    if mode == 'siec':
-        from siec_core.correction import compute_gamma, apply_consensus_correction
-
-    model.timesteps = timesteps
-    with torch.no_grad():
-        n = x.size(0)
-        seq_next = [-1] + list(seq[:-1])
-        x0_preds = []
-        xs = [x]
-        prv_f = None
-        cur_i = 0
-        
-        # ★ Trace 기록용
-        x0_trajectory = []        # 모든 reverse step의 x0 추정
-        syndrome_per_step = []    # syndrome score (IEC는 항상 계산, S-IEC는 자연히)
-        triggered_per_step = []
-        nfe_per_step = []
-        
-        for i, j in zip(reversed(seq), reversed(seq_next)):
-            t = (torch.ones(n) * i).to(x.device)
-            next_t = (torch.ones(n) * j).to(x.device)
-            at = compute_alpha(b, t.long())
-            at_next = compute_alpha(b, next_t.long())
-            xt = xs[-1].to('cuda')
-            
-            time_idx = len(xs) - 1
-            if quant:
-                model.set_time(time_idx)
-            
-            step_nfe = 0
-            
-            # Forward at t
-            if cur_i in interval_seq:
-                et, cur_f = model(xt, t, context=None, prv_f=None, branch=branch)
-                prv_f = cur_f[0]
-            else:
-                et, cur_f = model(xt, t, context=None, prv_f=prv_f, branch=branch)
-            if quant:
-                model.model.time = model.model.time - 1
-            step_nfe += 1
-            
-            # x̂_0(t)
-            x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
-            x0_preds.append(x0_t.to('cpu'))
-            x0_trajectory.append(x0_t.detach().cpu().clone())   # ★ 기록
-            
-            # DDIM coefficients
-            c1 = kwargs.get("eta", 0) * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
-            c2 = ((1 - at_next) - c1 ** 2).sqrt()
-            noise = torch.randn_like(x)
-            
-            # Tentative
-            xt_next_tent = at_next.sqrt() * x0_t + c1 * noise + c2 * et
-            xt_next_hat = xt_next_tent
-            
-            # ============================================
-            # Syndrome 측정 (두 모드 다 측정, correction은 mode별)
-            # ============================================
-            batch_score = 0.0
-            triggered = False
-            
-            # Algorithm-1 style: measure syndrome at every timestep.
-            # interval_seq is not used to restrict the syndrome check.
-            do_lookahead = (next_t.long()[0].item() >= 0)
-            
-            if do_lookahead:
-                # lookahead forward
-                et_look, _ = model(xt_next_tent, next_t, context=None, prv_f=None, branch=branch)
-                if quant:
-                    model.model.time = model.model.time - 1
-                step_nfe += 1
-                
-                x0_look = (xt_next_tent - et_look * (1 - at_next).sqrt()) / at_next.sqrt()
-                
-                # ★ syndrome 계산 (IEC도 측정, 비교용)
-                syndrome, score_per_sample = compute_syndrome(x0_t, x0_look)
-                batch_score = float(score_per_sample.mean().item())
-                
-                # ============================================
-                # Mode별 분기
-                # ============================================
-                if mode == 'iec':
-                    # IEC: fixed-point iteration (max_iter=2)
-                    # 원본 IEC 로직 재현
-                    for it in range(1, 2):   # iter 1 (이미 iter 0는 했음)
-                        # forward at t (xt_next_hat 입력)
-                        if cur_i in interval_seq:
-                            et_new, cur_f_new = model(xt_next_hat, t, context=None, prv_f=None, branch=branch)
-                            prv_f = cur_f_new[0]
-                        else:
-                            et_new, cur_f_new = model(xt_next_hat, t, context=None, prv_f=prv_f, branch=branch)
-                        if quant:
-                            model.model.time = model.model.time - 1
-                        step_nfe += 1
-                        
-                        xt_next_new = at_next.sqrt() * ((xt - et_new * (1 - at).sqrt()) / at.sqrt()) + \
-                                      c1 * noise + c2 * et_new
-                        
-                        residual = torch.norm(xt_next_new - xt_next_hat) / (torch.norm(xt_next_hat) + 1e-6)
-                        if residual < 1e-3:
-                            break
-                        
-                        gamma_iter = 0.5
-                        xt_next_hat = xt_next_hat + (gamma_iter ** it) * (xt_next_new - xt_next_hat)
-                    
-                    triggered = True   # IEC는 interval_seq 위치에서 항상 iteration
-                
-                elif mode == 'siec':
-                    # S-IEC: threshold-based trigger
-                    if siec_always_correct:
-                        triggered = True
-                    elif tau_schedule is not None:
-                        tau_t = float(tau_schedule[cur_i]) if cur_i < len(tau_schedule) else 0.0
-                        triggered = (batch_score > tau_t)
-                    
-                    if triggered:
-                        alpha_t_sq = float(at.reshape(-1)[0].item())
-                        sigma_t_sq = 1.0 - alpha_t_sq
-                        gamma = compute_gamma(alpha_t_sq, sigma_t_sq, c=c_siec)
-                        
-                        for _round in range(siec_max_rounds):
-                            x0_corrected = apply_consensus_correction(x0_t, syndrome, gamma)
-                            # ★ 핵심 수정
-                            et_corrected = (xt - at.sqrt() * x0_corrected) / (1 - at).sqrt()
-                            xt_next_hat = at_next.sqrt() * x0_corrected + c1 * noise + c2 * et_corrected
-        
-                            if _round < siec_max_rounds - 1:
-                                # 재검증 (max_rounds > 1일 때만)
-                                et_look_new, _ = model(xt_next_hat, next_t, context=None,
-                                                       prv_f=None, branch=branch)
-                                if quant:
-                                    model.model.time = model.model.time - 1
-                                step_nfe += 1
-                                x0_look_new = (xt_next_hat - et_look_new * (1 - at_next).sqrt()) / at_next.sqrt()
-                                syndrome, new_score = compute_syndrome(x0_t, x0_look_new)
-                                new_score_val = float(new_score.mean().item())
-                                if tau_schedule is not None and new_score_val <= tau_t:
-                                    break
-            
-            # If not triggered, accept the tentative DDIM transition.
-            # xt_next_hat is already xt_next_tent.
-            
-            syndrome_per_step.append(batch_score)
-            triggered_per_step.append(triggered)
-            nfe_per_step.append(step_nfe)
-            
-            xs.append(xt_next_hat.to('cpu'))
-            cur_i += 1
-    
-    trace = {
-        'x0_trajectory': x0_trajectory,       # list of CPU tensors
-        'syndrome_per_step': syndrome_per_step,
-        'triggered_per_step': triggered_per_step,
-        'nfe_per_step': nfe_per_step,
-    }
-    
-    return xs, x0_preds, trace
+    """Sampling with trace output for experiment wrappers."""
+    return _adaptive_generalized_core(
+        x, seq, model, b, timesteps,
+        interval_seq=interval_seq, branch=branch, quant=quant,
+        correction_mode=mode,
+        c_siec=c_siec,
+        tau_schedule=tau_schedule,
+        siec_always_correct=siec_always_correct,
+        siec_max_rounds=siec_max_rounds,
+        return_trace=True,
+        **kwargs,
+    )

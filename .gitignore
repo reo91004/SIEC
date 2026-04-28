@@ -8,6 +8,16 @@ __pycache__/
 *.pth
 *.pt
 *.npy
+*.pb
+*.ckpt
+
+# 로컬 실행용 baseline/runtime assets
+atlas/
+calibration/
+data/
+data_cifar10/
+error_dec/
+mainldm/
 
 # 로그
 *.log

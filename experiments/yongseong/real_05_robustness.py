@@ -12,7 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 
-IEC_ROOT = Path(__file__).resolve().parent.parent
+IEC_ROOT = Path(__file__).resolve().parents[2]
 EXP_DIR = IEC_ROOT / "experiments/yongseong"
 DEFAULT_RESULTS_BASE = EXP_DIR / "results/real_05_robustness"
 CALIB = IEC_ROOT / "calibration"
@@ -63,6 +63,9 @@ def parse_args():
     p.add_argument("--percentile", type=float, default=80.0)
     p.add_argument("--siec-max-rounds", type=int, default=2)
     p.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_BASE)
+    p.add_argument("--reuse-lookahead", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--siec-score-mode", choices=["raw", "mean", "calibrated"], default="raw")
+    p.add_argument("--siec-stats-path", type=Path, default=None)
     p.add_argument(
         "--cuda-visible-devices",
         default=os.environ.get("CUDA_VISIBLE_DEVICES", "2"),
@@ -118,13 +121,17 @@ def png_count(folder: Path) -> int:
     return sum(1 for _ in folder.glob("*.png"))
 
 
-def pilot_scores_path(label: str) -> Path:
-    return CALIB / f"pilot_scores_{label}.pt"
+def _suffix(args=None) -> str:
+    return "_reuse" if getattr(args, "reuse_lookahead", False) else ""
 
 
-def tau_schedule_path(label: str, percentile: float) -> Path:
+def pilot_scores_path(label: str, args=None) -> Path:
+    return CALIB / f"pilot_scores_{label}{_suffix(args)}.pt"
+
+
+def tau_schedule_path(label: str, percentile: float, args=None) -> Path:
     p = int(round(percentile))
-    return CALIB / f"tau_schedule_{label}_p{p}.pt"
+    return CALIB / f"tau_schedule_{label}{_suffix(args)}_p{p}.pt"
 
 
 def setting_defs() -> dict[str, dict]:
@@ -309,6 +316,17 @@ def build_setting_flags(info: dict) -> list[str]:
     return flags
 
 
+def _siec_common_flags(args) -> list[str]:
+    flags = []
+    if args.reuse_lookahead:
+        flags.append("--reuse_lookahead")
+    if args.siec_score_mode != "raw":
+        flags += ["--siec_score_mode", args.siec_score_mode]
+        if args.siec_stats_path is not None:
+            flags += ["--siec_stats_path", rel(args.siec_stats_path)]
+    return flags
+
+
 def build_pilot_cmd(args, label: str, info: dict) -> list[str]:
     return conda_python(args) + [
         entry_script("ddim_cifar_siec.py"),
@@ -316,18 +334,19 @@ def build_pilot_cmd(args, label: str, info: dict) -> list[str]:
         "--num_samples", str(args.pilot_samples),
         "--sample_batch", str(args.sample_batch),
         "--siec_collect_scores",
-        "--siec_scores_out", rel(pilot_scores_path(label)),
+        "--siec_scores_out", rel(pilot_scores_path(label, args)),
         "--image_folder", rel(ERROR_DEC / f"image_robust_pilot_{label}_n{args.pilot_samples}"),
         *build_setting_flags(info),
+        *_siec_common_flags(args),
     ]
 
 
 def build_calibrate_cmd(args, label: str) -> list[str]:
     return conda_python(args) + [
         entry_script("calibrate_tau_cifar.py"),
-        "--scores_path", rel(pilot_scores_path(label)),
+        "--scores_path", rel(pilot_scores_path(label, args)),
         "--percentile", str(int(round(args.percentile))),
-        "--out_path", rel(tau_schedule_path(label, args.percentile)),
+        "--out_path", rel(tau_schedule_path(label, args.percentile, args)),
     ]
 
 
@@ -346,8 +365,9 @@ def build_main_cmd(args, label: str, info: dict, method_key: str, image_folder: 
     ]
     if method_key == "siec":
         cmd += [
-            "--tau_path", rel(tau_schedule_path(label, args.percentile)),
+            "--tau_path", rel(tau_schedule_path(label, args.percentile, args)),
             "--tau_percentile", str(int(round(args.percentile))),
+            *_siec_common_flags(args),
         ]
     return cmd
 
@@ -430,17 +450,17 @@ def aggregate_trace(trace_path_: Path) -> dict:
     }
 
 
-def compute_error_strength(label: str) -> float:
+def compute_error_strength(label: str, args) -> float:
     if label == "fp16":
         return 0.0
     import numpy as np
     import torch
 
-    raw_scores = torch.load(pilot_scores_path(label), weights_only=False, map_location="cpu")
+    raw_scores = torch.load(pilot_scores_path(label, args), weights_only=False, map_location="cpu")
     if isinstance(raw_scores, dict):
         scores = raw_scores.get("scores_by_t")
         if scores is None:
-            raise RuntimeError(f"pilot payload missing scores_by_t: {pilot_scores_path(label)}")
+            raise RuntimeError(f"pilot payload missing scores_by_t: {pilot_scores_path(label, args)}")
     else:
         scores = raw_scores
     per_t = []
@@ -449,7 +469,7 @@ def compute_error_strength(label: str) -> float:
         if np_arr.size and np.any(np_arr != 0):
             per_t.append(float(np_arr.mean()))
     if not per_t:
-        raise RuntimeError(f"no non-zero syndrome bins found in {pilot_scores_path(label)}")
+        raise RuntimeError(f"no non-zero syndrome bins found in {pilot_scores_path(label, args)}")
     return float(sum(per_t) / len(per_t))
 
 
@@ -460,7 +480,7 @@ def phase_pilot(args, report: dict[str, dict], cmd_sink: list[list[str]]) -> Non
         info = report[label]
         if info["status"] != "runnable":
             continue
-        if pilot_scores_path(label).exists():
+        if pilot_scores_path(label, args).exists():
             continue
         cmd = build_pilot_cmd(args, label, info)
         cmd_sink.append(cmd)
@@ -476,7 +496,7 @@ def phase_calibrate(args, report: dict[str, dict], cmd_sink: list[list[str]]) ->
         info = report[label]
         if info["status"] != "runnable":
             continue
-        tau = tau_schedule_path(label, args.percentile)
+        tau = tau_schedule_path(label, args.percentile, args)
         if tau.exists():
             ready.add(label)
             continue
@@ -544,13 +564,13 @@ def phase_main(args, report: dict[str, dict], cmd_sink: list[list[str]], tau_rea
         attach_runtime_targets(args, iec_row, label, "iec", info, cmd_sink)
         rows.append(iec_row)
 
-        if tau_schedule_path(label, args.percentile).exists() or label in tau_ready:
+        if tau_schedule_path(label, args.percentile, args).exists() or label in tau_ready:
             siec_row = make_row(label, "siec", "S-IEC", args.num_samples)
             siec_row["tau_percentile"] = int(round(args.percentile))
             attach_runtime_targets(args, siec_row, label, "siec", info, cmd_sink)
             rows.append(siec_row)
         else:
-            rows.append(blocked_row(label, "siec", "S-IEC", f"missing tau schedule: {rel(tau_schedule_path(label, args.percentile))}"))
+            rows.append(blocked_row(label, "siec", "S-IEC", f"missing tau schedule: {rel(tau_schedule_path(label, args.percentile, args))}"))
 
     return rows
 
@@ -618,15 +638,15 @@ def apply_fp16_shared_rows(rows: list[dict]) -> None:
             row["status"] = "completed"
 
 
-def fill_post_hoc(rows: list[dict], report: dict[str, dict]) -> None:
+def fill_post_hoc(rows: list[dict], report: dict[str, dict], args) -> None:
     cache: dict[str, float] = {}
     for row in rows:
         if row.get("status") in {"blocked", "missing_asset"}:
             continue
         label = row["setting"]
         if label not in cache:
-            if label == "fp16" or pilot_scores_path(label).exists():
-                cache[label] = compute_error_strength(label)
+            if label == "fp16" or pilot_scores_path(label, args).exists():
+                cache[label] = compute_error_strength(label, args)
             else:
                 cache[label] = None
         row["error_strength"] = cache[label]
@@ -817,7 +837,7 @@ def main() -> None:
         rows = phase_main(args, report, cmd_list, tau_ready=tau_ready)
     if args.phase in ("fid", "all"):
         phase_fid(rows, args)
-        fill_post_hoc(rows, report)
+        fill_post_hoc(rows, report, args)
 
     write_commands(cmd_list, args.results_dir / "commands.sh")
     if rows:

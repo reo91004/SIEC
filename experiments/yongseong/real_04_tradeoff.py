@@ -12,10 +12,9 @@ import subprocess
 import time
 from pathlib import Path
 
-IEC_ROOT = Path(__file__).resolve().parent.parent
+IEC_ROOT = Path(__file__).resolve().parents[2]
 EXP_DIR = IEC_ROOT / "experiments/yongseong"
 DEFAULT_RESULTS_BASE = EXP_DIR / "results/real_04_tradeoff"
-PILOT_SCORES = IEC_ROOT / "calibration/pilot_scores_nb.pt"
 REFERENCE_NPZ = IEC_ROOT / "cifar10_reference.npz"
 CIFAR_IMAGE_DIR = IEC_ROOT / "error_dec/cifar"
 NUM_STEPS = 100
@@ -58,6 +57,7 @@ def parse_args():
     p.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--num-samples", type=int, default=2000)
     p.add_argument("--sample-batch", type=int, default=500)
+    p.add_argument("--pilot-samples", type=int, default=512)
     p.add_argument("--percentiles", type=int, nargs="+", default=[30, 50, 60, 70, 80, 90, 95])
     p.add_argument("--timesteps", type=int, default=100)
     p.add_argument("--siec-max-rounds", type=int, default=2)
@@ -66,6 +66,9 @@ def parse_args():
     p.add_argument("--skip-sampling", action="store_true")
     p.add_argument("--skip-fid", action="store_true")
     p.add_argument("--plot-only", action="store_true")
+    p.add_argument("--reuse-lookahead", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--siec-score-mode", choices=["raw", "mean", "calibrated"], default="raw")
+    p.add_argument("--siec-stats-path", type=Path, default=None)
     p.add_argument(
         "--cuda-visible-devices",
         default=os.environ.get("CUDA_VISIBLE_DEVICES", "2"),
@@ -115,8 +118,14 @@ def entry_script(name: str) -> str:
     return f"mainddpm/{name}"
 
 
-def tau_path(percentile: int) -> Path:
-    return IEC_ROOT / f"calibration/tau_schedule_p{percentile}.pt"
+def pilot_scores_path(args) -> Path:
+    suffix = "_reuse" if args.reuse_lookahead else ""
+    return IEC_ROOT / f"calibration/pilot_scores_nb{suffix}.pt"
+
+
+def tau_path(args, percentile: int) -> Path:
+    suffix = "_reuse" if args.reuse_lookahead else ""
+    return IEC_ROOT / f"calibration/tau_schedule{suffix}_p{percentile}.pt"
 
 
 def png_count(folder: Path) -> int:
@@ -171,22 +180,47 @@ def run_fid(args, sample_npz: Path, log_path: Path) -> tuple[float | None, float
 
 
 def ensure_tau_schedules(args, cmd_sink: list[list[str]]) -> None:
+    pilot_path = pilot_scores_path(args)
+    if not pilot_path.exists():
+        pilot_cmd = conda_python(args) + [
+            entry_script("ddim_cifar_siec.py"),
+            "--correction-mode", "siec",
+            "--num_samples", str(args.pilot_samples),
+            "--sample_batch", str(args.sample_batch),
+            "--siec_collect_scores",
+            "--siec_scores_out", rel(pilot_path),
+            "--image_folder", rel(CIFAR_IMAGE_DIR / f"image_tradeoff_pilot_n{args.pilot_samples}"),
+            "--weight_bit", "8",
+            "--act_bit", "8",
+            "--replicate_interval", "10",
+        ]
+        if args.reuse_lookahead:
+            pilot_cmd.append("--reuse_lookahead")
+        if args.siec_score_mode != "raw":
+            pilot_cmd += ["--siec_score_mode", args.siec_score_mode]
+            if args.siec_stats_path is not None:
+                pilot_cmd += ["--siec_stats_path", rel(args.siec_stats_path)]
+        cmd_sink.append(pilot_cmd)
+        if not args.dry_run:
+            run_cmd(pilot_cmd, args.results_dir / "logs" / "pilot_scores.log")
+
     for percentile in args.percentiles:
-        if tau_path(percentile).exists():
+        if tau_path(args, percentile).exists():
             continue
         cmd = conda_python(args) + [
             entry_script("calibrate_tau_cifar.py"),
-            "--scores_path", "./calibration/pilot_scores_nb.pt",
+            "--scores_path", rel(pilot_path),
             "--percentile", str(percentile),
-            "--out_path", f"./calibration/tau_schedule_p{percentile}.pt",
+            "--out_path", rel(tau_path(args, percentile)),
         ]
         cmd_sink.append(cmd)
         if not args.dry_run:
             run_cmd(cmd, args.results_dir / "logs" / f"calibrate_p{percentile}.log")
 
 
-def pilot_trigger_rate(percentile: int) -> float | None:
-    if not tau_path(percentile).exists() or not PILOT_SCORES.exists():
+def pilot_trigger_rate(args, percentile: int) -> float | None:
+    pilot_path = pilot_scores_path(args)
+    if not tau_path(args, percentile).exists() or not pilot_path.exists():
         return None
     try:
         import numpy as np
@@ -194,14 +228,14 @@ def pilot_trigger_rate(percentile: int) -> float | None:
     except ModuleNotFoundError:
         return None
 
-    raw_scores = torch.load(PILOT_SCORES, weights_only=False, map_location="cpu")
+    raw_scores = torch.load(pilot_path, weights_only=False, map_location="cpu")
     if isinstance(raw_scores, dict):
         scores_by_t = raw_scores.get("scores_by_t", [])
         batch_means_by_t = raw_scores.get("batch_score_means_by_t", [])
     else:
         scores_by_t = raw_scores
         batch_means_by_t = None
-    tau = np.asarray(torch.load(tau_path(percentile), weights_only=False, map_location="cpu")).reshape(-1)
+    tau = np.asarray(torch.load(tau_path(args, percentile), weights_only=False, map_location="cpu")).reshape(-1)
     rates = []
     for step in range(NUM_STEPS):
         arr = np.asarray(scores_by_t[step]) if step < len(scores_by_t) else np.array([])
@@ -273,7 +307,7 @@ def build_sampling_cmd(
     ]
     if tau_percentile is not None:
         cmd += [
-            "--tau_path", rel(tau_path(tau_percentile)),
+            "--tau_path", rel(tau_path(args, tau_percentile)),
             "--tau_percentile", str(tau_percentile),
         ]
     if always_correct:
@@ -284,6 +318,12 @@ def build_sampling_cmd(
         cmd += ["--trigger_prob", f"{trigger_prob:.8f}"]
     if trigger_period is not None:
         cmd += ["--trigger_period", str(trigger_period)]
+    if correction_mode == "siec" and args.reuse_lookahead:
+        cmd.append("--reuse_lookahead")
+    if correction_mode == "siec" and args.siec_score_mode != "raw":
+        cmd += ["--siec_score_mode", args.siec_score_mode]
+        if args.siec_stats_path is not None:
+            cmd += ["--siec_stats_path", rel(args.siec_stats_path)]
     return cmd
 
 
@@ -341,7 +381,7 @@ def build_rows(args, cmd_sink: list[list[str]]) -> list[dict]:
         rows.append(row)
 
     match_percentile = 80
-    target_rate = pilot_trigger_rate(match_percentile)
+    target_rate = pilot_trigger_rate(args, match_percentile)
     if target_rate is None:
         random_row = make_base_row("random", f"Random trigger (matched to p{match_percentile})", args.num_samples)
         random_row["status"] = "blocked"

@@ -260,8 +260,37 @@ class Diffusion(object):
                     center=self.args.center, branch=self.args.branch,
                     eta=self.args.eta)
             else:
-                # ★ S-IEC branch
-                if getattr(self.args, 'use_siec', False):
+                correction_mode = getattr(self.args, 'correction_mode', 'auto')
+                if correction_mode == 'auto':
+                    correction_mode = 'siec' if getattr(self.args, 'use_siec', False) else 'iec'
+
+                if getattr(self.args, 'siec_return_trace', False):
+                    from ..functions.deepcache_denoising import adaptive_generalized_steps_trace
+                    xs_list, x0_preds_list, trace = adaptive_generalized_steps_trace(
+                        x, seq, model, self.betas,
+                        timesteps=timesteps,
+                        interval_seq=self.interval_seq,
+                        branch=self.args.branch,
+                        eta=self.args.eta,
+                        quant=self.args.ptq,
+                        mode=getattr(self.args, 'siec_trace_mode', correction_mode),
+                        c_siec=getattr(self.args, 'c_siec', 1.0),
+                        tau_schedule=getattr(self.args, 'tau_schedule', None),
+                        siec_always_correct=getattr(self.args, 'siec_always_correct', False),
+                        siec_max_rounds=getattr(self.args, 'siec_max_rounds', 1),
+                        trigger_mode=getattr(self.args, 'trigger_mode', 'syndrome'),
+                        trigger_prob=getattr(self.args, 'trigger_prob', 0.0),
+                        trigger_period=getattr(self.args, 'trigger_period', 1),
+                        syndrome_score_mode=getattr(self.args, 'siec_score_mode', 'raw'),
+                        syndrome_stats=getattr(self.args, 'siec_stats', None),
+                        reuse_lookahead=getattr(self.args, 'reuse_lookahead', False),
+                        trace_include_xs=getattr(self.args, 'trace_include_xs', False),
+                    )
+                    if not hasattr(self.args, '_siec_traces'):
+                        self.args._siec_traces = []
+                    self.args._siec_traces.append(trace)
+                    xs = (xs_list, x0_preds_list)
+                elif correction_mode == 'siec':
                     from ..functions.deepcache_denoising import adaptive_generalized_steps_siec
                     result = adaptive_generalized_steps_siec(
                         x, seq, model, self.betas,
@@ -275,6 +304,12 @@ class Diffusion(object):
                         siec_always_correct=getattr(self.args, 'siec_always_correct', False),
                         siec_collect_scores=getattr(self.args, 'siec_collect_scores', False),
                         siec_max_rounds=getattr(self.args, 'siec_max_rounds', 1),
+                        trigger_mode=getattr(self.args, 'trigger_mode', 'syndrome'),
+                        trigger_prob=getattr(self.args, 'trigger_prob', 0.0),
+                        trigger_period=getattr(self.args, 'trigger_period', 1),
+                        syndrome_score_mode=getattr(self.args, 'siec_score_mode', 'raw'),
+                        syndrome_stats=getattr(self.args, 'siec_stats', None),
+                        reuse_lookahead=getattr(self.args, 'reuse_lookahead', False),
                     )
                     # result is (xs, x0_preds) or (xs, x0_preds, scores)
                     if getattr(self.args, 'siec_collect_scores', False) and len(result) == 3:
@@ -286,6 +321,17 @@ class Diffusion(object):
                         xs = (xs_list, x0_preds_list)  # ★ tuple로 통일 (non-pilot과 동일 형태)
                     else:
                         xs = result
+                elif correction_mode in {'none', 'tac'}:
+                    from ..functions.deepcache_denoising import adaptive_generalized_steps_trace
+                    xs_list, x0_preds_list, _trace = adaptive_generalized_steps_trace(
+                        x, seq, model, self.betas,
+                        timesteps=timesteps,
+                        interval_seq=self.interval_seq, branch=self.args.branch,
+                        eta=self.args.eta,
+                        quant=self.args.ptq,
+                        mode=correction_mode,
+                    )
+                    xs = (xs_list, x0_preds_list)
                 else:
                     from ..functions.deepcache_denoising import adaptive_generalized_steps_3
                     xs = adaptive_generalized_steps_3(

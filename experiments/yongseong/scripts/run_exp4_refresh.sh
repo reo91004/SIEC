@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$ROOT_DIR"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
@@ -26,9 +26,9 @@ echo "[exp4-refresh] root_dir=$ROOT_DIR"
 echo "[exp4-refresh] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
 echo "[exp4-refresh] log_file=$LOG_FILE"
 
-if pgrep -af "ddim_cifar_siec.py.*pilot_scores_nb.pt" >/dev/null; then
+if pgrep -af "ddim_cifar_siec.py.*pilot_scores_nb_reuse.pt" >/dev/null; then
   echo "[exp4-refresh] existing pilot process detected:"
-  pgrep -af "ddim_cifar_siec.py.*pilot_scores_nb.pt"
+  pgrep -af "ddim_cifar_siec.py.*pilot_scores_nb_reuse.pt"
   echo "[exp4-refresh] stop the existing pilot first, then rerun this script."
   exit 1
 fi
@@ -36,7 +36,7 @@ fi
 echo
 echo "[1/3] Regenerating S-IEC pilot scores"
 run conda run --no-capture-output -n iec \
-  python experiments/yongseong/ddim_cifar_siec.py \
+  python mainddpm/ddim_cifar_siec.py \
   --correction-mode siec \
   --num_samples 512 \
   --sample_batch 500 \
@@ -45,22 +45,27 @@ run conda run --no-capture-output -n iec \
   --replicate_interval 10 \
   --image_folder error_dec/cifar/image_tradeoff_pilot_nb_n512 \
   --siec_collect_scores \
-  --siec_scores_out calibration/pilot_scores_nb.pt
+  --siec_scores_out calibration/pilot_scores_nb_reuse.pt \
+  --reuse_lookahead
 
 echo
 echo "[2/3] Regenerating tau schedules"
 for percentile in "${PERCENTILES[@]}"; do
   run conda run --no-capture-output -n iec \
     python mainddpm/calibrate_tau_cifar.py \
-    --scores_path ./calibration/pilot_scores_nb.pt \
+    --scores_path ./calibration/pilot_scores_nb_reuse.pt \
     --percentile "$percentile" \
-    --out_path "./calibration/tau_schedule_p${percentile}.pt"
+    --out_path "./calibration/tau_schedule_reuse_p${percentile}.pt"
 done
 
 echo
 echo "[3/3] Running exp4 tradeoff wrapper"
 run conda run --no-capture-output -n iec \
-  python experiments/real_04_tradeoff.py --no-dry-run
+  python experiments/yongseong/real_04_tradeoff.py \
+  --no-dry-run \
+  --reuse-lookahead \
+  --pilot-samples 512 \
+  --percentiles "${PERCENTILES[@]}"
 
 echo
 echo "[exp4-refresh] completed successfully"
