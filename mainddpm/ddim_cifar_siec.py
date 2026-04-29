@@ -148,9 +148,27 @@ if __name__ == "__main__":
                         help="Force full-compute path at every step while keeping trace-capable sampler")
     parser.add_argument("--trace_include_xs", action="store_true", default=False,
                         help="Store x_t trajectory in trace diagnostics")
+    parser.add_argument("--collect_clean_drift_stats", type=str, default=None,
+                        help="Path (.pt) to save clean trajectory drift stats. "
+                             "When set, forces ptq=off, disable_cache_reuse=on, "
+                             "correction_mode=siec, siec_collect_scores=on, "
+                             "siec_score_mode=raw — accumulator collects "
+                             "(x0_lookahead - x0_current) per step.")
     # ===============================================
 
     args = parser.parse_args()
+
+    # Clean-drift stats calibration mode forces a specific configuration:
+    # PTQ off, full-compute (no cache reuse), siec sampler with lookahead,
+    # no correction (collect_scores=True), raw score (no stats yet).
+    if args.collect_clean_drift_stats is not None:
+        args.ptq = False
+        args.disable_cache_reuse = True
+        args.correction_mode = "siec"
+        args.use_siec = False  # disables pilot-scores save flow at end of main
+        args.siec_collect_scores = True  # keeps lookahead, skips correction
+        args.siec_score_mode = "raw"
+        args.siec_return_trace = False
 
     if not os.path.exists(args.image_folder):
         os.makedirs(args.image_folder)
@@ -231,6 +249,20 @@ if __name__ == "__main__":
         args.siec_stats = load_syndrome_stats(args.siec_stats_path)
         logger.info(f"[S-IEC] Loaded syndrome stats from {args.siec_stats_path}")
 
+    args.drift_accumulator = None
+    if args.collect_clean_drift_stats is not None:
+        from siec_core.calibration import DriftStatsAccumulator
+        args.drift_accumulator = DriftStatsAccumulator(
+            num_steps=args.timesteps,
+            shape=(config.data.channels, config.data.image_size, config.data.image_size),
+            device="cpu",
+            dtype=torch.float64,
+        )
+        logger.info(
+            f"[Calib] DriftStatsAccumulator created: T={args.timesteps}, "
+            f"shape=({config.data.channels},{config.data.image_size},{config.data.image_size})"
+        )
+
     from ddpm.runners.deepcache import Diffusion
     runner = Diffusion(args, config, interval_seq=args.interval_seq)
     model = runner.creat_model()
@@ -303,6 +335,31 @@ if __name__ == "__main__":
     else:
         seed_everything(args.seed)
         runner.sample_fid(model, total_n_samples=args.num_samples)
+
+    # ========== Save clean-drift stats if calibration mode ==========
+    if args.collect_clean_drift_stats is not None and args.drift_accumulator is not None:
+        payload = args.drift_accumulator.finalize(eps=1e-6)
+        payload["config"] = {
+            "num_samples": int(args.num_samples),
+            "sample_batch": int(args.sample_batch),
+            "seed": int(args.seed),
+            "timesteps": int(args.timesteps),
+            "ptq": bool(args.ptq),
+            "disable_cache_reuse": bool(args.disable_cache_reuse),
+            "replicate_interval": int(args.replicate_interval),
+            "weight_bit": int(args.weight_bit),
+            "act_bit": int(args.act_bit),
+        }
+        out_path = args.collect_clean_drift_stats
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        torch.save(payload, out_path)
+        logger.info(
+            f"[Calib] Saved clean drift stats to {out_path} "
+            f"(min_count={int(payload['count'].min().item())}, "
+            f"max_count={int(payload['count'].max().item())})"
+        )
 
     # ========== Save pilot scores if in pilot mode ==========
     if args.use_siec and args.siec_collect_scores:

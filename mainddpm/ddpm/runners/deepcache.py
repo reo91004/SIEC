@@ -285,6 +285,7 @@ class Diffusion(object):
                         syndrome_stats=getattr(self.args, 'siec_stats', None),
                         reuse_lookahead=getattr(self.args, 'reuse_lookahead', False),
                         trace_include_xs=getattr(self.args, 'trace_include_xs', False),
+                        drift_accumulator=getattr(self.args, 'drift_accumulator', None),
                     )
                     if not hasattr(self.args, '_siec_traces'):
                         self.args._siec_traces = []
@@ -310,6 +311,7 @@ class Diffusion(object):
                         syndrome_score_mode=getattr(self.args, 'siec_score_mode', 'raw'),
                         syndrome_stats=getattr(self.args, 'siec_stats', None),
                         reuse_lookahead=getattr(self.args, 'reuse_lookahead', False),
+                        drift_accumulator=getattr(self.args, 'drift_accumulator', None),
                     )
                     # result is (xs, x0_preds) or (xs, x0_preds, scores)
                     if getattr(self.args, 'siec_collect_scores', False) and len(result) == 3:

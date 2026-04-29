@@ -384,6 +384,7 @@ def _adaptive_generalized_core(
     reuse_lookahead=False,
     return_trace=False,
     trace_include_xs=False,
+    drift_accumulator=None,
     **kwargs
 ):
     from siec_core.syndrome import compute_syndrome
@@ -486,6 +487,8 @@ def _adaptive_generalized_core(
                     )
                     step_nfe += 1
                     x0_look = (xt_next_tent - et_look * (1 - at_next).sqrt()) / at_next.sqrt()
+                    if drift_accumulator is not None:
+                        drift_accumulator.update(cur_i, (x0_look - x0_t).detach())
                     syndrome, score = compute_syndrome(
                         x0_t,
                         x0_look,
