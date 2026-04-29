@@ -47,6 +47,12 @@ CSV_KEYS = [
     "sampling_wall_clock_sec",
     "fid_wall_clock_sec",
     "total_wall_clock_sec",
+    "score_mode",
+    "reuse_lookahead",
+    "stats_path",
+    "tau_path",
+    "seed_start",
+    "seed_end",
     "trace_path",
     "source_npz",
     "source_log",
@@ -70,14 +76,45 @@ def parse_args():
     p.add_argument("--skip-fid", action="store_true")
     p.add_argument("--plot-only", action="store_true")
     p.add_argument("--reuse-lookahead", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--siec-score-mode", choices=["raw", "mean", "calibrated"], default="raw")
-    p.add_argument("--siec-stats-path", type=Path, default=None)
+    p.add_argument("--siec-score-mode", choices=["raw", "mean", "calibrated"], default="raw",
+                   help="Legacy single-mode selector (kept for backward compat). Prefer --score-modes.")
+    p.add_argument("--score-modes", default=None,
+                   help="Comma-separated S-IEC score modes to evaluate (e.g. 'raw,mean,calibrated'). "
+                        "If unset, falls back to --siec-score-mode for a single-mode run.")
+    p.add_argument("--siec-stats-path", type=Path, default=None,
+                   help="Clean trajectory drift stats .pt for mean/calibrated modes.")
+    p.add_argument("--seed-base", type=int, default=2048,
+                   help="Sampler seed (calibration uses [0, 2047]; evaluation defaults to 2048).")
     p.add_argument(
         "--cuda-visible-devices",
         default=os.environ.get("CUDA_VISIBLE_DEVICES", "2"),
         help="GPU visibility for generated commands and subprocesses (default: 2).",
     )
     return p.parse_args()
+
+
+def parse_score_modes(args) -> list[str]:
+    if args.score_modes is not None:
+        modes = [m.strip() for m in args.score_modes.split(",") if m.strip()]
+    else:
+        modes = [args.siec_score_mode]
+    valid = {"raw", "mean", "calibrated"}
+    bad = [m for m in modes if m not in valid]
+    if bad:
+        raise SystemExit(f"invalid --score-modes entries: {bad}; allowed: {sorted(valid)}")
+    seen: list[str] = []
+    for m in modes:
+        if m not in seen:
+            seen.append(m)
+    needs_stats = any(m != "raw" for m in seen)
+    if needs_stats and args.siec_stats_path is None:
+        raise SystemExit(
+            "--score-modes contains mean/calibrated but --siec-stats-path is missing. "
+            "Pass e.g. --siec-stats-path calibration/syndrome_stats_clean_seed0_n2048.pt"
+        )
+    if needs_stats and not Path(args.siec_stats_path).exists():
+        raise SystemExit(f"--siec-stats-path does not exist: {args.siec_stats_path}")
+    return seen
 
 
 def current_run_id() -> str:
@@ -121,14 +158,16 @@ def entry_script(name: str) -> str:
     return f"mainddpm/{name}"
 
 
-def pilot_scores_path(args) -> Path:
-    suffix = "_reuse" if args.reuse_lookahead else ""
-    return IEC_ROOT / f"calibration/pilot_scores_nb{suffix}.pt"
+def pilot_scores_path(args, score_mode: str = "raw") -> Path:
+    reuse = "_reuse" if args.reuse_lookahead else ""
+    mode = "" if score_mode == "raw" else f"_{score_mode}"
+    return IEC_ROOT / f"calibration/pilot_scores_nb{mode}{reuse}.pt"
 
 
-def tau_path(args, percentile: int) -> Path:
-    suffix = "_reuse" if args.reuse_lookahead else ""
-    return IEC_ROOT / f"calibration/tau_schedule{suffix}_p{percentile}.pt"
+def tau_path(args, percentile: int, score_mode: str = "raw") -> Path:
+    reuse = "_reuse" if args.reuse_lookahead else ""
+    mode = "" if score_mode == "raw" else f"_{score_mode}"
+    return IEC_ROOT / f"calibration/tau_schedule{mode}{reuse}_p{percentile}.pt"
 
 
 def pilot_scores_are_usable(path: Path) -> bool:
@@ -205,49 +244,53 @@ def run_fid(args, sample_npz: Path, log_path: Path) -> tuple[float | None, float
     return fid, sfid, elapsed
 
 
-def ensure_tau_schedules(args, cmd_sink: list[list[str]]) -> None:
-    pilot_path = pilot_scores_path(args)
-    regenerate_pilot = not pilot_scores_are_usable(pilot_path)
-    if regenerate_pilot:
-        pilot_cmd = conda_python(args) + [
-            entry_script("ddim_cifar_siec.py"),
-            "--correction-mode", "siec",
-            "--num_samples", str(args.pilot_samples),
-            "--sample_batch", str(min(args.pilot_sample_batch, args.pilot_samples)),
-            "--siec_collect_scores",
-            "--siec_scores_out", rel(pilot_path),
-            "--image_folder", rel(CIFAR_IMAGE_DIR / f"image_tradeoff_pilot_n{args.pilot_samples}"),
-            "--weight_bit", "8",
-            "--act_bit", "8",
-            "--replicate_interval", "10",
-        ]
-        if args.reuse_lookahead:
-            pilot_cmd.append("--reuse_lookahead")
-        if args.siec_score_mode != "raw":
-            pilot_cmd += ["--siec_score_mode", args.siec_score_mode]
-            if args.siec_stats_path is not None:
-                pilot_cmd += ["--siec_stats_path", rel(args.siec_stats_path)]
-        cmd_sink.append(pilot_cmd)
-        if not args.dry_run:
-            run_cmd(pilot_cmd, args.results_dir / "logs" / "pilot_scores.log")
+def ensure_tau_schedules(args, cmd_sink: list[list[str]], score_modes: list[str] | None = None) -> None:
+    if score_modes is None:
+        score_modes = parse_score_modes(args)
+    for score_mode in score_modes:
+        pilot_path = pilot_scores_path(args, score_mode)
+        regenerate_pilot = not pilot_scores_are_usable(pilot_path)
+        if regenerate_pilot:
+            pilot_cmd = conda_python(args) + [
+                entry_script("ddim_cifar_siec.py"),
+                "--correction-mode", "siec",
+                "--num_samples", str(args.pilot_samples),
+                "--sample_batch", str(min(args.pilot_sample_batch, args.pilot_samples)),
+                "--siec_collect_scores",
+                "--siec_scores_out", rel(pilot_path),
+                "--image_folder", rel(CIFAR_IMAGE_DIR / f"image_tradeoff_pilot_{score_mode}_n{args.pilot_samples}"),
+                "--weight_bit", "8",
+                "--act_bit", "8",
+                "--replicate_interval", "10",
+            ]
+            if args.reuse_lookahead:
+                pilot_cmd.append("--reuse_lookahead")
+            if score_mode != "raw":
+                pilot_cmd += ["--siec_score_mode", score_mode]
+                if args.siec_stats_path is not None:
+                    pilot_cmd += ["--siec_stats_path", rel(args.siec_stats_path)]
+            cmd_sink.append(pilot_cmd)
+            if not args.dry_run:
+                run_cmd(pilot_cmd, args.results_dir / "logs" / f"pilot_scores_{score_mode}.log")
 
-    for percentile in args.percentiles:
-        if tau_path(args, percentile).exists() and not regenerate_pilot:
-            continue
-        cmd = conda_python(args) + [
-            entry_script("calibrate_tau_cifar.py"),
-            "--scores_path", rel(pilot_path),
-            "--percentile", str(percentile),
-            "--out_path", rel(tau_path(args, percentile)),
-        ]
-        cmd_sink.append(cmd)
-        if not args.dry_run:
-            run_cmd(cmd, args.results_dir / "logs" / f"calibrate_p{percentile}.log")
+        for percentile in args.percentiles:
+            if tau_path(args, percentile, score_mode).exists() and not regenerate_pilot:
+                continue
+            cmd = conda_python(args) + [
+                entry_script("calibrate_tau_cifar.py"),
+                "--scores_path", rel(pilot_path),
+                "--percentile", str(percentile),
+                "--out_path", rel(tau_path(args, percentile, score_mode)),
+            ]
+            cmd_sink.append(cmd)
+            if not args.dry_run:
+                run_cmd(cmd, args.results_dir / "logs" / f"calibrate_{score_mode}_p{percentile}.log")
 
 
-def pilot_trigger_rate(args, percentile: int) -> float | None:
-    pilot_path = pilot_scores_path(args)
-    if not tau_path(args, percentile).exists() or not pilot_path.exists():
+def pilot_trigger_rate(args, percentile: int, score_mode: str = "raw") -> float | None:
+    pilot_path = pilot_scores_path(args, score_mode)
+    tau_p = tau_path(args, percentile, score_mode)
+    if not tau_p.exists() or not pilot_path.exists():
         return None
     try:
         import numpy as np
@@ -262,7 +305,7 @@ def pilot_trigger_rate(args, percentile: int) -> float | None:
     else:
         scores_by_t = raw_scores
         batch_means_by_t = None
-    tau = np.asarray(torch.load(tau_path(args, percentile), weights_only=False, map_location="cpu")).reshape(-1)
+    tau = np.asarray(torch.load(tau_p, weights_only=False, map_location="cpu")).reshape(-1)
     rates = []
     for step in range(NUM_STEPS):
         arr = np.asarray(scores_by_t[step]) if step < len(scores_by_t) else np.array([])
@@ -281,7 +324,9 @@ def pilot_trigger_rate(args, percentile: int) -> float | None:
     return float(sum(rates) / len(rates))
 
 
-def make_base_row(method_key: str, method: str, num_samples: int, notes: str = "") -> dict:
+def make_base_row(method_key: str, method: str, num_samples: int, notes: str = "",
+                  score_mode: str | None = None, reuse_lookahead: bool | None = None,
+                  stats_path: str | None = None, seed_base: int | None = None) -> dict:
     return {
         "setting": SETTING_KEY,
         "method_key": method_key,
@@ -302,6 +347,12 @@ def make_base_row(method_key: str, method: str, num_samples: int, notes: str = "
         "sampling_wall_clock_sec": None,
         "fid_wall_clock_sec": None,
         "total_wall_clock_sec": None,
+        "score_mode": score_mode,
+        "reuse_lookahead": reuse_lookahead,
+        "stats_path": stats_path,
+        "tau_path": None,
+        "seed_start": seed_base,
+        "seed_end": seed_base,
         "trace_path": None,
         "source_npz": None,
         "source_log": None,
@@ -319,12 +370,14 @@ def build_sampling_cmd(
     trigger_mode: str | None = None,
     trigger_prob: float | None = None,
     trigger_period: int | None = None,
+    score_mode: str = "raw",
 ) -> list[str]:
     cmd = conda_python(args) + [
         entry_script("ddim_cifar_siec.py"),
         "--correction-mode", correction_mode,
         "--num_samples", str(args.num_samples),
         "--sample_batch", str(args.sample_batch),
+        "--seed", str(args.seed_base),
         "--weight_bit", "8",
         "--act_bit", "8",
         "--replicate_interval", "10",
@@ -336,7 +389,7 @@ def build_sampling_cmd(
     ]
     if tau_percentile is not None:
         cmd += [
-            "--tau_path", rel(tau_path(args, tau_percentile)),
+            "--tau_path", rel(tau_path(args, tau_percentile, score_mode)),
             "--tau_percentile", str(tau_percentile),
         ]
     if always_correct:
@@ -349,8 +402,8 @@ def build_sampling_cmd(
         cmd += ["--trigger_period", str(trigger_period)]
     if correction_mode == "siec" and args.reuse_lookahead:
         cmd.append("--reuse_lookahead")
-    if correction_mode == "siec" and args.siec_score_mode != "raw":
-        cmd += ["--siec_score_mode", args.siec_score_mode]
+    if correction_mode == "siec" and score_mode != "raw":
+        cmd += ["--siec_score_mode", score_mode]
         if args.siec_stats_path is not None:
             cmd += ["--siec_stats_path", rel(args.siec_stats_path)]
     return cmd
@@ -371,71 +424,130 @@ def attach_runtime_targets(args, row: dict, slug: str, correction_mode: str, **c
     row["trace_path"] = rel(trace_path_)
     row["source_npz"] = rel(npz_path)
     row["source_log"] = rel(fid_log)
+    score_mode = cmd_kwargs.get("score_mode", "raw")
+    is_siec = correction_mode == "siec"
+    if is_siec and row.get("score_mode") is None:
+        row["score_mode"] = score_mode
+    if row.get("reuse_lookahead") is None:
+        row["reuse_lookahead"] = bool(args.reuse_lookahead) if is_siec else None
+    if (
+        is_siec and row.get("stats_path") is None
+        and score_mode != "raw" and args.siec_stats_path is not None
+    ):
+        row["stats_path"] = rel(args.siec_stats_path)
+    if row.get("seed_start") is None:
+        row["seed_start"] = args.seed_base
+        row["seed_end"] = args.seed_base
+    tau_percentile = cmd_kwargs.get("tau_percentile")
+    if is_siec and tau_percentile is not None:
+        row["tau_path"] = rel(tau_path(args, tau_percentile, score_mode))
     row["_cmd"] = build_sampling_cmd(args, correction_mode, image_folder, trace_path_, **cmd_kwargs)
     row["_needs_run"] = not trace_path_.exists() or (not npz_path.exists() and png_count(image_folder) < args.num_samples)
 
 
 def build_rows(args, cmd_sink: list[list[str]]) -> list[dict]:
     rows: list[dict] = []
+    score_modes = parse_score_modes(args)
 
-    row = make_base_row("no_correction", "No correction", args.num_samples, notes="W8A8 + DeepCache deployed path; correction disabled")
+    row = make_base_row(
+        "no_correction", "No correction", args.num_samples,
+        notes="W8A8 + DeepCache deployed path; correction disabled",
+        score_mode=None, reuse_lookahead=None, seed_base=args.seed_base,
+    )
     attach_runtime_targets(args, row, "no_correction", "none")
     if row["_needs_run"]:
         cmd_sink.append(row["_cmd"])
     rows.append(row)
 
-    row = make_base_row("tac", "TAC", args.num_samples, notes="TAC skeleton only")
+    row = make_base_row("tac", "TAC", args.num_samples, notes="TAC skeleton only", seed_base=args.seed_base)
     row["status"] = "blocked"
     row["blocked_reason"] = "TAC not implemented"
     rows.append(row)
 
-    row = make_base_row("iec", "IEC", args.num_samples, notes="fresh 2K IEC baseline")
+    row = make_base_row(
+        "iec", "IEC", args.num_samples, notes="fresh 2K IEC baseline",
+        score_mode=None, reuse_lookahead=None, seed_base=args.seed_base,
+    )
     attach_runtime_targets(args, row, "iec", "iec")
     if row["_needs_run"]:
         cmd_sink.append(row["_cmd"])
     rows.append(row)
 
-    row = make_base_row("always_on", "Naive always-on refinement", args.num_samples, notes="S-IEC always-correct ablation")
+    row = make_base_row(
+        "always_on", "Naive always-on refinement", args.num_samples,
+        notes="S-IEC always-correct ablation",
+        score_mode="raw", reuse_lookahead=bool(args.reuse_lookahead), seed_base=args.seed_base,
+    )
     attach_runtime_targets(args, row, "always_on", "siec", always_correct=True)
     if row["_needs_run"]:
         cmd_sink.append(row["_cmd"])
     rows.append(row)
 
-    for percentile in args.percentiles:
-        row = make_base_row("siec", f"S-IEC p{percentile}", args.num_samples, notes="tau sweep")
-        row["tau_percentile"] = percentile
-        attach_runtime_targets(args, row, f"siec_p{percentile}", "siec", tau_percentile=percentile)
-        if row["_needs_run"]:
-            cmd_sink.append(row["_cmd"])
-        rows.append(row)
+    multi_mode = len(score_modes) > 1
+    for score_mode in score_modes:
+        mode_tag = f"_{score_mode}" if multi_mode else ""
+        method_key = f"siec_{score_mode}" if multi_mode else "siec"
+        for percentile in args.percentiles:
+            row = make_base_row(
+                method_key, f"S-IEC[{score_mode}] p{percentile}", args.num_samples,
+                notes="tau sweep",
+                score_mode=score_mode, reuse_lookahead=bool(args.reuse_lookahead),
+                stats_path=rel(args.siec_stats_path) if (score_mode != "raw" and args.siec_stats_path) else None,
+                seed_base=args.seed_base,
+            )
+            row["tau_percentile"] = percentile
+            attach_runtime_targets(
+                args, row, f"siec{mode_tag}_p{percentile}", "siec",
+                tau_percentile=percentile, score_mode=score_mode,
+            )
+            if row["_needs_run"]:
+                cmd_sink.append(row["_cmd"])
+            rows.append(row)
 
+    primary_mode = score_modes[0]
     match_percentile = 80
-    target_rate = pilot_trigger_rate(args, match_percentile)
+    target_rate = pilot_trigger_rate(args, match_percentile, primary_mode)
+    multi_mode_note = (
+        f" [multi-mode active: random/uniform matched ONLY to primary={primary_mode}; "
+        "non-primary modes have no own NFE-matched control]"
+        if multi_mode else ""
+    )
     if target_rate is None:
-        random_row = make_base_row("random", f"Random trigger (matched to p{match_percentile})", args.num_samples)
+        random_row = make_base_row(
+            "random", f"Random trigger (matched to {primary_mode} p{match_percentile})",
+            args.num_samples, score_mode=primary_mode,
+            reuse_lookahead=bool(args.reuse_lookahead), seed_base=args.seed_base,
+        )
         random_row["status"] = "blocked"
-        random_row["blocked_reason"] = f"tau schedule missing for p{match_percentile}"
+        random_row["blocked_reason"] = f"tau schedule missing for {primary_mode} p{match_percentile}"
         rows.append(random_row)
 
-        uniform_row = make_base_row("uniform", f"Uniform periodic (matched to p{match_percentile})", args.num_samples)
+        uniform_row = make_base_row(
+            "uniform", f"Uniform periodic (matched to {primary_mode} p{match_percentile})",
+            args.num_samples, score_mode=primary_mode,
+            reuse_lookahead=bool(args.reuse_lookahead), seed_base=args.seed_base,
+        )
         uniform_row["status"] = "blocked"
-        uniform_row["blocked_reason"] = f"tau schedule missing for p{match_percentile}"
+        uniform_row["blocked_reason"] = f"tau schedule missing for {primary_mode} p{match_percentile}"
         rows.append(uniform_row)
     else:
         random_row = make_base_row(
             "random",
-            f"Random trigger (matched to p{match_percentile})",
+            f"Random trigger (matched to {primary_mode} p{match_percentile})",
             args.num_samples,
-            notes=f"expected trigger rate from pilot/tau = {target_rate:.4f}",
+            notes=f"expected trigger rate from pilot/tau = {target_rate:.4f}{multi_mode_note}",
+            score_mode=primary_mode, reuse_lookahead=bool(args.reuse_lookahead),
+            seed_base=args.seed_base,
         )
         attach_runtime_targets(
             args,
             random_row,
-            f"random_matched_p{match_percentile}",
+            f"random_matched_{primary_mode}_p{match_percentile}",
             "siec",
             trigger_mode="random",
             trigger_prob=target_rate,
             trigger_period=5,
+            score_mode=primary_mode,
         )
         if random_row["_needs_run"]:
             cmd_sink.append(random_row["_cmd"])
@@ -445,18 +557,21 @@ def build_rows(args, cmd_sink: list[list[str]]) -> list[dict]:
         realized = 1.0 / period
         uniform_row = make_base_row(
             "uniform",
-            f"Uniform periodic (matched to p{match_percentile})",
+            f"Uniform periodic (matched to {primary_mode} p{match_percentile})",
             args.num_samples,
-            notes=f"target rate={target_rate:.4f}, realized periodic rate={realized:.4f}",
+            notes=f"target rate={target_rate:.4f}, realized periodic rate={realized:.4f}{multi_mode_note}",
+            score_mode=primary_mode, reuse_lookahead=bool(args.reuse_lookahead),
+            seed_base=args.seed_base,
         )
         attach_runtime_targets(
             args,
             uniform_row,
-            f"uniform_matched_p{match_percentile}_period{period}",
+            f"uniform_matched_{primary_mode}_p{match_percentile}_period{period}",
             "siec",
             trigger_mode="uniform",
             trigger_prob=0.0,
             trigger_period=period,
+            score_mode=primary_mode,
         )
         if uniform_row["_needs_run"]:
             cmd_sink.append(uniform_row["_cmd"])
@@ -708,6 +823,7 @@ def plot_two_panel(rows: list[dict], out_png: Path) -> None:
         "uniform": "#2F4F4F",
         "tac": "#28A050",
     }
+    siec_mode_colors = {"raw": "#E07814", "mean": "#1F77B4", "calibrated": "#2CA02C"}
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
     ready = completed_rows(rows)
 
@@ -715,66 +831,80 @@ def plot_two_panel(rows: list[dict], out_png: Path) -> None:
         ax.set_facecolor("white")
         ax.grid(alpha=0.3)
 
-    siec_rows = [r for r in ready if r["method_key"] == "siec" and r.get("tau_percentile") is not None]
+    def _is_siec_curve_row(r: dict) -> bool:
+        key = r.get("method_key", "")
+        return (key == "siec" or key.startswith("siec_")) and r.get("tau_percentile") is not None
+
+    siec_rows = [r for r in ready if _is_siec_curve_row(r)]
     if siec_rows:
-        left_items = sorted(siec_rows, key=lambda r: r["nfe_total"])
-        right_items = sorted(siec_rows, key=lambda r: r["trigger_rate"])
-
-        axes[0].plot(
-            [r["nfe_total"] for r in left_items],
-            [r["fid"] for r in left_items],
-            "-",
-            color=colors["siec"],
-            linewidth=2,
-            alpha=0.7,
-            label="S-IEC curve",
-        )
-        axes[1].plot(
-            [r["trigger_rate"] for r in right_items],
-            [r["fid"] for r in right_items],
-            "-",
-            color=colors["siec"],
-            linewidth=2,
-            alpha=0.7,
-            label="S-IEC curve",
-        )
-
-        for row in siec_rows:
-            tau = int(row["tau_percentile"])
-            axes[0].scatter(
-                row["nfe_total"],
-                row["fid"],
-                s=60,
-                marker="o",
-                color=colors["siec"],
-                edgecolors="k",
-                linewidths=0.5,
-                zorder=5,
+        modes_present: list[str] = []
+        for r in siec_rows:
+            m = r.get("score_mode") or "raw"
+            if m not in modes_present:
+                modes_present.append(m)
+        for mode in modes_present:
+            mode_rows = [r for r in siec_rows if (r.get("score_mode") or "raw") == mode]
+            if not mode_rows:
+                continue
+            color = siec_mode_colors.get(mode, colors["siec"])
+            label = f"S-IEC[{mode}] curve" if len(modes_present) > 1 else "S-IEC curve"
+            left_items = sorted(mode_rows, key=lambda r: r["nfe_total"])
+            right_items = sorted(mode_rows, key=lambda r: r["trigger_rate"])
+            axes[0].plot(
+                [r["nfe_total"] for r in left_items],
+                [r["fid"] for r in left_items],
+                "-",
+                color=color,
+                linewidth=2,
+                alpha=0.7,
+                label=label,
             )
-            axes[1].scatter(
-                row["trigger_rate"],
-                row["fid"],
-                s=60,
-                marker="o",
-                color=colors["siec"],
-                edgecolors="k",
-                linewidths=0.5,
-                zorder=5,
+            axes[1].plot(
+                [r["trigger_rate"] for r in right_items],
+                [r["fid"] for r in right_items],
+                "-",
+                color=color,
+                linewidth=2,
+                alpha=0.7,
+                label=label,
             )
-            axes[0].annotate(
-                f"τ={tau}",
-                (row["nfe_total"], row["fid"]),
-                fontsize=8,
-                textcoords="offset points",
-                xytext=(5, 5),
-            )
-            axes[1].annotate(
-                f"τ={tau}",
-                (row["trigger_rate"], row["fid"]),
-                fontsize=8,
-                textcoords="offset points",
-                xytext=(5, 5),
-            )
+            for row in mode_rows:
+                tau = int(row["tau_percentile"])
+                axes[0].scatter(
+                    row["nfe_total"],
+                    row["fid"],
+                    s=60,
+                    marker="o",
+                    color=color,
+                    edgecolors="k",
+                    linewidths=0.5,
+                    zorder=5,
+                )
+                axes[1].scatter(
+                    row["trigger_rate"],
+                    row["fid"],
+                    s=60,
+                    marker="o",
+                    color=color,
+                    edgecolors="k",
+                    linewidths=0.5,
+                    zorder=5,
+                )
+                tau_label = f"τ={tau}" + (f" {mode[0]}" if len(modes_present) > 1 else "")
+                axes[0].annotate(
+                    tau_label,
+                    (row["nfe_total"], row["fid"]),
+                    fontsize=8,
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                )
+                axes[1].annotate(
+                    tau_label,
+                    (row["trigger_rate"], row["fid"]),
+                    fontsize=8,
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                )
 
     baseline_specs = {
         "no_correction": ("X", colors["uncorr"], "No correction"),
@@ -870,14 +1000,22 @@ def write_compute_matched(rows: list[dict], out_md: Path) -> None:
     if iec is None:
         out_md.write_text("# Compute-Matched Row\n\nIEC row is not completed yet.\n")
         return
-    candidates = [
-        row for row in ready
-        if row["method_key"] == "siec" and row.get("num_samples") == iec.get("num_samples")
+
+    siec_rows = [
+        r for r in ready
+        if (r["method_key"] == "siec" or r["method_key"].startswith("siec_"))
+        and r.get("num_samples") == iec.get("num_samples")
+        and r.get("tau_percentile") is not None
     ]
-    if not candidates:
+    if not siec_rows:
         out_md.write_text("# Compute-Matched Row\n\nS-IEC sweep rows are not completed yet.\n")
         return
-    matched = min(candidates, key=lambda row: abs(row["nfe_total"] - iec["nfe_total"]))
+
+    modes_present: list[str] = []
+    for r in siec_rows:
+        m = r.get("score_mode") or "raw"
+        if m not in modes_present:
+            modes_present.append(m)
 
     def fmt(value, places=4):
         return "—" if value is None else f"{value:.{places}f}"
@@ -891,31 +1029,39 @@ def write_compute_matched(rows: list[dict], out_md: Path) -> None:
             return f"**{fmt(a, places)}**", fmt(b, places)
         return fmt(a, places), f"**{fmt(b, places)}**"
 
-    iec_fid, matched_fid = best(iec.get("fid"), matched.get("fid"), lower_is_better=True, places=4)
-    iec_sfid, matched_sfid = best(iec.get("sfid"), matched.get("sfid"), lower_is_better=True, places=4)
-    iec_time, matched_time = best(
-        iec.get("total_wall_clock_sec"),
-        matched.get("total_wall_clock_sec"),
-        lower_is_better=True,
-        places=2,
-    )
-
     lines = [
         "# Table-Style Compute-Matched Comparison",
         "",
         f"reference_method = `{iec['method']}`",
         f"matching_rule = nearest S-IEC point by `total_nfe` at the same `num_samples`",
         f"num_samples = {iec['num_samples']}",
+        f"score_modes = {modes_present}",
         "",
-        "| Method | Total NFE | Per-sample NFE | FID | sFID | Trigger rate | Wall-clock (s) |",
-        "|---|---:|---:|---:|---:|---:|---:|",
-        f"| {iec['method']} | {fmt(iec['nfe_total'], 0)} | {fmt(iec['per_sample_nfe'], 2)} | {iec_fid} | {iec_sfid} | {fmt(iec['trigger_rate'])} | {iec_time} |",
-        f"| {matched['method']} | {fmt(matched['nfe_total'], 0)} | {fmt(matched['per_sample_nfe'], 2)} | {matched_fid} | {matched_sfid} | {fmt(matched['trigger_rate'])} | {matched_time} |",
-        "",
-        f"matched_tau = `{matched.get('tau_percentile')}`",
-        f"delta_total_nfe = {fmt(abs(matched['nfe_total'] - iec['nfe_total']), 0)}",
-        "",
+        "| Score mode | Method | Total NFE | Per-sample NFE | FID | sFID | Trigger rate | Wall-clock (s) | Δ NFE |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        f"| (ref) | {iec['method']} | {fmt(iec['nfe_total'], 0)} | {fmt(iec['per_sample_nfe'], 2)} | {fmt(iec['fid'])} | {fmt(iec['sfid'])} | {fmt(iec['trigger_rate'])} | {fmt(iec['total_wall_clock_sec'], 2)} | — |",
     ]
+    for mode in modes_present:
+        candidates = [r for r in siec_rows if (r.get("score_mode") or "raw") == mode]
+        if not candidates:
+            continue
+        matched = min(candidates, key=lambda row: abs(row["nfe_total"] - iec["nfe_total"]))
+        iec_fid, matched_fid = best(iec.get("fid"), matched.get("fid"), lower_is_better=True, places=4)
+        _, matched_sfid = best(iec.get("sfid"), matched.get("sfid"), lower_is_better=True, places=4)
+        _, matched_time = best(
+            iec.get("total_wall_clock_sec"),
+            matched.get("total_wall_clock_sec"),
+            lower_is_better=True,
+            places=2,
+        )
+        delta = abs(matched["nfe_total"] - iec["nfe_total"])
+        lines.append(
+            f"| {mode} | {matched['method']} (τ={matched.get('tau_percentile')}) | "
+            f"{fmt(matched['nfe_total'], 0)} | {fmt(matched['per_sample_nfe'], 2)} | "
+            f"{matched_fid} | {matched_sfid} | {fmt(matched['trigger_rate'])} | "
+            f"{matched_time} | {fmt(delta, 0)} |"
+        )
+    lines.append("")
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text("\n".join(lines))
 
