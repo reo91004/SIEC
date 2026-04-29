@@ -339,6 +339,9 @@ if __name__ == "__main__":
     # ========== Save clean-drift stats if calibration mode ==========
     if args.collect_clean_drift_stats is not None and args.drift_accumulator is not None:
         payload = args.drift_accumulator.finalize(eps=1e-6)
+        payload["residual_definition"] = "drift_t = x0_lookahead(t-1) - x0_current(t)"
+        payload["num_steps"] = int(payload["mu"].shape[0])
+        payload["num_samples"] = int(args.num_samples)
         payload["config"] = {
             "num_samples": int(args.num_samples),
             "sample_batch": int(args.sample_batch),

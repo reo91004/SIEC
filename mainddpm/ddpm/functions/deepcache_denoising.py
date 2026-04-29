@@ -415,6 +415,9 @@ def _adaptive_generalized_core(
         next_t_int_per_step = []
         refresh_step_per_step = []
         memo_hit_per_step = []
+        memo_committed_per_step = []
+        memo_discarded_per_step = []
+        lookahead_cache_mode_per_step = []
 
         for cur_i, (i, j) in enumerate(zip(reversed(seq), reversed(seq_next))):
             t = (torch.ones(n) * i).to(x.device)
@@ -433,12 +436,14 @@ def _adaptive_generalized_core(
                 reuse_lookahead
                 and lookahead_memo is not None
                 and int(t[0].item()) == lookahead_memo["t_int"]
-                and not refresh_step
             )
 
             if memo_hit:
                 et = lookahead_memo["et"].to(x.device)
                 x0_t = lookahead_memo["x0"].to(x.device)
+                memo_prv_f = lookahead_memo.get("prv_f_after_commit")
+                if memo_prv_f is not None:
+                    prv_f = memo_prv_f
                 lookahead_memo = None
             else:
                 if refresh_step:
@@ -463,6 +468,9 @@ def _adaptive_generalized_core(
             triggered = False
             batch_score = 0.0
             score_values = []
+            look_cache_mode = "none"
+            memo_committed = False
+            memo_discarded = False
 
             if mode in {"none", "tac"}:
                 pass
@@ -482,7 +490,8 @@ def _adaptive_generalized_core(
                 if checked:
                     next_refresh = (cur_i + 1) in interval_set
                     look_prv_f = None if (not reuse_lookahead or next_refresh) else prv_f
-                    et_look, _ = _call_model(
+                    look_cache_mode = "full" if look_prv_f is None else "quick"
+                    et_look, cur_f_look = _call_model(
                         model, xt_next_tent, next_t, look_prv_f, branch, quant, cur_i + 1, timesteps
                     )
                     step_nfe += 1
@@ -507,6 +516,7 @@ def _adaptive_generalized_core(
                         )
 
                         if triggered:
+                            memo_discarded = bool(reuse_lookahead)
                             alpha_t_sq = float(at.reshape(-1)[0].item())
                             sigma_t_sq = 1.0 - alpha_t_sq
                             gamma = compute_gamma(alpha_t_sq, sigma_t_sq, c=c_siec)
@@ -531,12 +541,18 @@ def _adaptive_generalized_core(
                                     )
                                     if tau_t is not None and float(new_score.mean().item()) <= tau_t:
                                         break
-                        elif reuse_lookahead and not next_refresh:
+                        elif reuse_lookahead:
+                            prv_f_after_commit = (
+                                cur_f_look[0].detach() if look_cache_mode == "full" else prv_f
+                            )
                             lookahead_memo = {
                                 "t_int": int(next_t[0].item()),
                                 "et": et_look.detach(),
                                 "x0": x0_look.detach(),
+                                "lookahead_cache_mode": look_cache_mode,
+                                "prv_f_after_commit": prv_f_after_commit,
                             }
+                            memo_committed = True
             else:
                 raise ValueError(f"unknown correction_mode: {correction_mode}")
 
@@ -551,6 +567,9 @@ def _adaptive_generalized_core(
             next_t_int_per_step.append(int(next_t[0].item()))
             refresh_step_per_step.append(bool(refresh_step))
             memo_hit_per_step.append(bool(memo_hit))
+            memo_committed_per_step.append(bool(memo_committed))
+            memo_discarded_per_step.append(bool(memo_discarded))
+            lookahead_cache_mode_per_step.append(str(look_cache_mode))
 
             xs.append(xt_next_hat.to("cpu"))
 
@@ -570,6 +589,9 @@ def _adaptive_generalized_core(
         "next_t_int_per_step": next_t_int_per_step,
         "refresh_step_per_step": refresh_step_per_step,
         "memo_hit_per_step": memo_hit_per_step,
+        "memo_committed_per_step": memo_committed_per_step,
+        "memo_discarded_per_step": memo_discarded_per_step,
+        "lookahead_cache_mode_per_step": lookahead_cache_mode_per_step,
     }
     if return_trace:
         return xs, x0_preds, trace
