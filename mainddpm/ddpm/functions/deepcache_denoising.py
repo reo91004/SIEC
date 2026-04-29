@@ -409,6 +409,11 @@ def _adaptive_generalized_core(
         checked_per_step = []
         triggered_per_step = []
         nfe_per_step = []
+        step_idx_per_step = []
+        t_int_per_step = []
+        next_t_int_per_step = []
+        refresh_step_per_step = []
+        memo_hit_per_step = []
 
         for cur_i, (i, j) in enumerate(zip(reversed(seq), reversed(seq_next))):
             t = (torch.ones(n) * i).to(x.device)
@@ -538,6 +543,11 @@ def _adaptive_generalized_core(
             checked_per_step.append(bool(checked))
             triggered_per_step.append(bool(triggered))
             nfe_per_step.append(int(step_nfe))
+            step_idx_per_step.append(int(cur_i))
+            t_int_per_step.append(int(t[0].item()))
+            next_t_int_per_step.append(int(next_t[0].item()))
+            refresh_step_per_step.append(bool(refresh_step))
+            memo_hit_per_step.append(bool(memo_hit))
 
             xs.append(xt_next_hat.to("cpu"))
 
@@ -552,6 +562,11 @@ def _adaptive_generalized_core(
         "checked_per_step": checked_per_step,
         "triggered_per_step": triggered_per_step,
         "nfe_per_step": nfe_per_step,
+        "step_idx_per_step": step_idx_per_step,
+        "t_int_per_step": t_int_per_step,
+        "next_t_int_per_step": next_t_int_per_step,
+        "refresh_step_per_step": refresh_step_per_step,
+        "memo_hit_per_step": memo_hit_per_step,
     }
     if return_trace:
         return xs, x0_preds, trace

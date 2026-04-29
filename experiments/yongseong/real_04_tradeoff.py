@@ -38,6 +38,8 @@ CSV_KEYS = [
     "fid",
     "sfid",
     "trigger_rate",
+    "checked_rate",
+    "memo_hit_rate",
     "syndrome_mean",
     "error_strength",
     "per_sample_nfe",
@@ -291,6 +293,8 @@ def make_base_row(method_key: str, method: str, num_samples: int, notes: str = "
         "fid": None,
         "sfid": None,
         "trigger_rate": None,
+        "checked_rate": None,
+        "memo_hit_rate": None,
         "syndrome_mean": None,
         "error_strength": None,
         "per_sample_nfe": None,
@@ -471,18 +475,24 @@ def aggregate_trace(trace_path_: Path) -> dict:
     total_nfe = 0.0
     total_triggered = 0.0
     total_checked = 0.0
+    total_memo_hits = 0.0
+    total_steps = 0.0
     syndrome_values: list[float] = []
     step_score_values: list[list[float]] = []
     for trace in traces:
         batch_size = int(trace.get("batch_size", 1))
         total_weight += batch_size
-        total_nfe += batch_size * float(sum(trace.get("nfe_per_step", [])))
+        nfe_list = trace.get("nfe_per_step", [])
+        total_nfe += batch_size * float(sum(nfe_list))
+        total_steps += batch_size * len(nfe_list)
         checked = trace.get("checked_per_step", [])
         triggered = trace.get("triggered_per_step", [])
+        memo_hits = trace.get("memo_hit_per_step", [])
         total_checked += batch_size * sum(1 for flag in checked if flag)
         total_triggered += batch_size * sum(
             1 for check, flag in zip(checked, triggered) if check and flag
         )
+        total_memo_hits += batch_size * sum(1 for flag in memo_hits if flag)
         for step_idx, values in enumerate(trace.get("score_values_per_step", [])):
             while len(step_score_values) <= step_idx:
                 step_score_values.append([])
@@ -490,10 +500,14 @@ def aggregate_trace(trace_path_: Path) -> dict:
             step_score_values[step_idx].extend(step_values)
             syndrome_values.extend(float(v) for v in values)
     trigger_rate = (total_triggered / total_checked) if total_checked else 0.0
+    checked_rate = (total_checked / total_steps) if total_steps else 0.0
+    memo_hit_rate = (total_memo_hits / total_steps) if total_steps else 0.0
     syndrome_mean = (sum(syndrome_values) / len(syndrome_values)) if syndrome_values else None
     return {
         "per_sample_nfe": (total_nfe / total_weight) if total_weight else None,
         "trigger_rate": trigger_rate,
+        "checked_rate": checked_rate,
+        "memo_hit_rate": memo_hit_rate,
         "syndrome_mean": syndrome_mean,
         "syndrome_values": syndrome_values,
         "step_score_values": step_score_values,
@@ -594,6 +608,8 @@ def update_row_from_trace(row: dict, results_dir: Path) -> None:
     metrics = aggregate_trace(trace_path_)
     row["per_sample_nfe"] = metrics["per_sample_nfe"]
     row["trigger_rate"] = metrics["trigger_rate"]
+    row["checked_rate"] = metrics["checked_rate"]
+    row["memo_hit_rate"] = metrics["memo_hit_rate"]
     row["syndrome_mean"] = metrics["syndrome_mean"]
     if row.get("num_samples") and row.get("per_sample_nfe") is not None:
         row["nfe_total"] = row["num_samples"] * row["per_sample_nfe"]
