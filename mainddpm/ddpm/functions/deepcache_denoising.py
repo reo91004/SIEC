@@ -355,7 +355,7 @@ def _tau_value(tau_schedule, step_idx):
     return float(tau_schedule[step_idx]) if step_idx < len(tau_schedule) else 0.0
 
 
-def _trigger_decision(mode, score_value, tau_t, step_idx, prob, period):
+def _trigger_decision(mode, score_value, tau_t, step_idx, prob, period, oracle_topk_mask=None):
     mode = (mode or "syndrome").lower()
     if mode == "syndrome":
         return tau_t is not None and score_value > tau_t
@@ -364,6 +364,11 @@ def _trigger_decision(mode, score_value, tau_t, step_idx, prob, period):
     if mode == "uniform":
         p = max(1, int(period or 1))
         return step_idx % p == 0
+    if mode in ("oracle_topk", "step_set"):
+        if oracle_topk_mask is None:
+            raise ValueError(f"trigger_mode={mode} requires oracle_topk_mask")
+        idx = step_idx if step_idx < len(oracle_topk_mask) else len(oracle_topk_mask) - 1
+        return bool(oracle_topk_mask[idx])
     raise ValueError(f"unknown trigger_mode: {mode}")
 
 
@@ -385,6 +390,9 @@ def _adaptive_generalized_core(
     return_trace=False,
     trace_include_xs=False,
     drift_accumulator=None,
+    score_source="syndrome",
+    oracle_scores=None,
+    oracle_topk_mask=None,
     **kwargs
 ):
     from siec_core.syndrome import compute_syndrome
@@ -406,6 +414,7 @@ def _adaptive_generalized_core(
         x0_trajectory = []
         xs_trajectory = []
         syndrome_per_step = []
+        trigger_score_per_step = []
         score_values_per_step = []
         checked_per_step = []
         triggered_per_step = []
@@ -467,6 +476,7 @@ def _adaptive_generalized_core(
             checked = False
             triggered = False
             batch_score = 0.0
+            syndrome_batch_score = 0.0
             score_values = []
             look_cache_mode = "none"
             memo_committed = False
@@ -505,14 +515,19 @@ def _adaptive_generalized_core(
                         stats=syndrome_stats,
                         step_idx=cur_i,
                     )
-                    batch_score = float(score.mean().item())
+                    syndrome_batch_score = float(score.mean().item())
+                    if score_source == "oracle" and oracle_scores is not None:
+                        idx = cur_i if cur_i < len(oracle_scores) else len(oracle_scores) - 1
+                        batch_score = float(oracle_scores[idx])
+                    else:
+                        batch_score = syndrome_batch_score
                     score_values = [float(v) for v in score.detach().cpu().reshape(-1)]
 
                     if not siec_collect_scores:
                         tau_t = _tau_value(tau_schedule, cur_i)
                         triggered = (
                             True if siec_always_correct else
-                            _trigger_decision(trigger_mode, batch_score, tau_t, cur_i, trigger_prob, trigger_period)
+                            _trigger_decision(trigger_mode, batch_score, tau_t, cur_i, trigger_prob, trigger_period, oracle_topk_mask=oracle_topk_mask)
                         )
 
                         if triggered:
@@ -556,8 +571,9 @@ def _adaptive_generalized_core(
             else:
                 raise ValueError(f"unknown correction_mode: {correction_mode}")
 
-            collected_scores.append(batch_score)
-            syndrome_per_step.append(batch_score)
+            collected_scores.append(syndrome_batch_score)
+            syndrome_per_step.append(syndrome_batch_score)
+            trigger_score_per_step.append(batch_score)
             score_values_per_step.append(score_values)
             checked_per_step.append(bool(checked))
             triggered_per_step.append(bool(triggered))
@@ -577,9 +593,11 @@ def _adaptive_generalized_core(
         "batch_size": int(n),
         "correction_mode": mode,
         "syndrome_score_mode": syndrome_score_mode,
+        "score_source": str(score_source),
         "x0_trajectory": x0_trajectory,
         "xs_trajectory": xs_trajectory,
         "syndrome_per_step": syndrome_per_step,
+        "trigger_score_per_step": trigger_score_per_step,
         "score_values_per_step": score_values_per_step,
         "checked_per_step": checked_per_step,
         "triggered_per_step": triggered_per_step,

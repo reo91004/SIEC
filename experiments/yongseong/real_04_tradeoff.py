@@ -85,6 +85,12 @@ def parse_args():
                    help="Clean trajectory drift stats .pt for mean/calibrated modes.")
     p.add_argument("--seed-base", type=int, default=2048,
                    help="Sampler seed (calibration uses [0, 2047]; evaluation defaults to 2048).")
+    p.add_argument("--oracle-score-path", type=Path, default=None,
+                   help="Oracle score artifact (.pt) from compute_oracle_score.py. "
+                        "When provided, an oracle_topk row is added matched to primary mode pilot rate.")
+    p.add_argument("--match-target-rate", type=float, default=None,
+                   help="If set, override pilot-derived random/uniform/oracle target rate. "
+                        "Use for strict NFE-matching to realized S-IEC trigger rate.")
     p.add_argument(
         "--cuda-visible-devices",
         default=os.environ.get("CUDA_VISIBLE_DEVICES", "2"),
@@ -371,6 +377,7 @@ def build_sampling_cmd(
     trigger_prob: float | None = None,
     trigger_period: int | None = None,
     score_mode: str = "raw",
+    oracle_topk: int | None = None,
 ) -> list[str]:
     cmd = conda_python(args) + [
         entry_script("ddim_cifar_siec.py"),
@@ -406,6 +413,15 @@ def build_sampling_cmd(
         cmd += ["--siec_score_mode", score_mode]
         if args.siec_stats_path is not None:
             cmd += ["--siec_stats_path", rel(args.siec_stats_path)]
+    if trigger_mode == "oracle_topk":
+        if not getattr(args, "oracle_score_path", None):
+            raise ValueError("trigger_mode=oracle_topk requires args.oracle_score_path")
+        if oracle_topk is None or int(oracle_topk) <= 0:
+            raise ValueError("trigger_mode=oracle_topk requires oracle_topk K>0")
+        cmd += [
+            "--oracle_score_path", rel(Path(args.oracle_score_path)),
+            "--oracle_topk", str(int(oracle_topk)),
+        ]
     return cmd
 
 
@@ -506,7 +522,10 @@ def build_rows(args, cmd_sink: list[list[str]]) -> list[dict]:
 
     primary_mode = score_modes[0]
     match_percentile = 80
-    target_rate = pilot_trigger_rate(args, match_percentile, primary_mode)
+    if getattr(args, "match_target_rate", None) is not None:
+        target_rate = float(args.match_target_rate)
+    else:
+        target_rate = pilot_trigger_rate(args, match_percentile, primary_mode)
     multi_mode_note = (
         f" [multi-mode active: random/uniform matched ONLY to primary={primary_mode}; "
         "non-primary modes have no own NFE-matched control]"
@@ -576,6 +595,34 @@ def build_rows(args, cmd_sink: list[list[str]]) -> list[dict]:
         if uniform_row["_needs_run"]:
             cmd_sink.append(uniform_row["_cmd"])
         rows.append(uniform_row)
+
+        if getattr(args, "oracle_score_path", None) is not None:
+            oracle_topk_K = max(1, int(round(target_rate * args.timesteps)))
+            oracle_note = (
+                f"oracle top-K={oracle_topk_K} (target rate={target_rate:.4f}, "
+                f"realized={oracle_topk_K/args.timesteps:.4f}); "
+                f"score from {args.oracle_score_path.name}{multi_mode_note}"
+            )
+            oracle_row = make_base_row(
+                "oracle",
+                f"Oracle top-{oracle_topk_K} (matched to {primary_mode} p{match_percentile})",
+                args.num_samples,
+                notes=oracle_note,
+                score_mode=primary_mode, reuse_lookahead=bool(args.reuse_lookahead),
+                seed_base=args.seed_base,
+            )
+            attach_runtime_targets(
+                args,
+                oracle_row,
+                f"oracle_topk{oracle_topk_K}_{primary_mode}_p{match_percentile}",
+                "siec",
+                trigger_mode="oracle_topk",
+                score_mode=primary_mode,
+                oracle_topk=oracle_topk_K,
+            )
+            if oracle_row["_needs_run"]:
+                cmd_sink.append(oracle_row["_cmd"])
+            rows.append(oracle_row)
 
     return rows
 

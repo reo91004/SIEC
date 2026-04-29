@@ -129,9 +129,15 @@ if __name__ == "__main__":
                         default="./calibration/siec_trace.pt",
                         help="Where to save trace diagnostics")
     parser.add_argument("--trigger_mode",
-                        choices=["syndrome", "random", "uniform"],
+                        choices=["syndrome", "random", "uniform", "oracle_topk", "step_set"],
                         default="syndrome",
                         help="S-IEC trigger source")
+    parser.add_argument("--oracle_topk", type=int, default=None,
+                        help="When --trigger_mode=oracle_topk, trigger at the K steps "
+                             "with largest oracle score (requires --oracle_score_path)")
+    parser.add_argument("--trigger_steps", type=str, default=None,
+                        help="When --trigger_mode=step_set, comma-separated step indices "
+                             "(e.g. '12,34,56') at which IEC fires; all other steps skip.")
     parser.add_argument("--trigger_prob", type=float, default=0.0,
                         help="Random trigger probability")
     parser.add_argument("--trigger_period", type=int, default=1,
@@ -144,6 +150,16 @@ if __name__ == "__main__":
                         help="Clean/full-compute trajectory stats for calibrated S-IEC")
     parser.add_argument("--reuse_lookahead", action="store_true", default=False,
                         help="Speculatively reuse non-triggered lookahead output")
+    parser.add_argument("--score_source",
+                        choices=["syndrome", "oracle"],
+                        default="syndrome",
+                        help="Source of trigger score: syndrome (online) or oracle (precomputed per-step)")
+    parser.add_argument("--oracle_score_path", type=str, default=None,
+                        help="Path (.pt) to oracle_score artifact from compute_oracle_score.py")
+    parser.add_argument("--oracle_score_field",
+                        choices=["scores_mean", "scores_median", "scores_max", "scores_xs_mean"],
+                        default="scores_mean",
+                        help="Which oracle score tensor to use as the per-step trigger signal")
     parser.add_argument("--disable-cache-reuse", action="store_true", default=False,
                         help="Force full-compute path at every step while keeping trace-capable sampler")
     parser.add_argument("--trace_include_xs", action="store_true", default=False,
@@ -248,6 +264,55 @@ if __name__ == "__main__":
         from siec_core.syndrome import load_syndrome_stats
         args.siec_stats = load_syndrome_stats(args.siec_stats_path)
         logger.info(f"[S-IEC] Loaded syndrome stats from {args.siec_stats_path}")
+
+    args.oracle_scores = None
+    args.oracle_topk_mask = None
+    needs_oracle = args.score_source == "oracle" or args.trigger_mode == "oracle_topk"
+    if needs_oracle:
+        if not args.oracle_score_path:
+            raise ValueError(
+                "--oracle_score_path is required when --score_source=oracle "
+                "or --trigger_mode=oracle_topk"
+            )
+        oracle_artifact = torch.load(args.oracle_score_path, map_location="cpu")
+        if args.oracle_score_field not in oracle_artifact:
+            raise KeyError(
+                f"oracle artifact missing field '{args.oracle_score_field}'. "
+                f"available={list(oracle_artifact.keys())}"
+            )
+        oracle_tensor = oracle_artifact[args.oracle_score_field]
+        args.oracle_scores = oracle_tensor.tolist()
+        logger.info(
+            f"[S-IEC] Loaded oracle scores from {args.oracle_score_path} "
+            f"field={args.oracle_score_field} T={len(args.oracle_scores)}"
+        )
+        if args.trigger_mode == "oracle_topk":
+            if args.oracle_topk is None or args.oracle_topk <= 0:
+                raise ValueError("--trigger_mode=oracle_topk requires --oracle_topk K>0")
+            T = oracle_tensor.numel()
+            k = min(int(args.oracle_topk), T)
+            topk_idx = torch.topk(oracle_tensor, k=k, largest=True).indices
+            mask = torch.zeros(T, dtype=torch.bool)
+            mask[topk_idx] = True
+            args.oracle_topk_mask = mask.tolist()
+            logger.info(
+                f"[S-IEC] Oracle top-{k} trigger mask: triggers at "
+                f"{sorted([int(i) for i in topk_idx.tolist()])}"
+            )
+
+    if args.trigger_mode == "step_set":
+        if not args.trigger_steps:
+            raise ValueError("--trigger_mode=step_set requires --trigger_steps")
+        steps = [int(s.strip()) for s in args.trigger_steps.split(",") if s.strip()]
+        T = args.timesteps
+        mask = [False] * T
+        for s in steps:
+            if 0 <= s < T:
+                mask[s] = True
+        args.oracle_topk_mask = mask
+        logger.info(
+            f"[S-IEC] step_set trigger mask: triggers at {sorted(set(steps))} (T={T})"
+        )
 
     args.drift_accumulator = None
     if args.collect_clean_drift_stats is not None:
